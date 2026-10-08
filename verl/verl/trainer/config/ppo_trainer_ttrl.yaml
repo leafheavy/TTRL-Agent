@@ -10,8 +10,50 @@ ttrl:
   # Whether to enable TTRL, refer to (https://arxiv.org/abs/2504.16084)
   enable: false
 
+  # Reuse exactly the same rollout group for voting and GRPO, without downsampling.
+  # Requires n_votes_per_prompt = n_samples_per_prompt = rollout.n >= 2.
+  # Keep false to reproduce the original larger-voting-pool math recipes.
+  share_rollouts: false
+
+  # math: original labeled diagnostics; bfcl: Qwen FC or BFCL execution consensus,
+  # without reference answers, ground-truth metrics, or in-training validation.
+  # BFCL requires share_rollouts=True and extra_info.bfcl.functions.
+  reward_mode: math
+
+  consensus:
+    # One category per complete trajectory: ordered calls, ordered tool
+    # observations, or an explicitly observable FINAL state (one task goal).
+    # Single-turn benchmark inputs support calls only, without execution.
+    mode: observations
+
+    # Optional class -> public attribute lists. Empty uses task metadata.
+    # A public attribute must correspond to a real deployment query; neither
+    # visibility nor this declaration proves task correctness/observability.
+    observable_state: {}
+
   # Number of rollouts per prompt, used for actual training
   n_samples_per_prompt: ${actor_rollout_ref.rollout.n}
 
   # Number of rollouts per prompt, used for label voting
   n_votes_per_prompt: ${actor_rollout_ref.rollout.n}
+
+  # Apply group weights AFTER GRPO normalization, to policy advantages only.
+  # Enable actor.use_kl_loss separately; in-reward KL is incompatible with this mode.
+  q_weight:
+    # Disabled is the original w=1 baseline.
+    enabled: false
+
+    # Choices: uniform, linear, u_shaped.
+    mode: uniform
+
+    # Positive exponent for the non-uniform weight families.
+    power: 2.0
+
+    # Minimum ungated weight, between zero and one.
+    floor: 0.1
+
+    # Groups below this q receive zero policy weight.
+    min_q: 0.0
+
+    # Optionally multiply by the BFCL group's comparable rollout fraction.
+    multiply_valid_rate: false

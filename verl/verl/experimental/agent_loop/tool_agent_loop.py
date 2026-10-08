@@ -16,7 +16,7 @@ import json
 import logging
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Dict, List
 from uuid import uuid4
 
 import regex as re
@@ -104,7 +104,15 @@ class ToolAgentLoop(AgentLoopBase):
         cls.max_tool_response_length = config.actor_rollout_ref.rollout.multi_turn.max_tool_response_length
         cls.tool_response_truncate_side = config.actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
         tool_config_path = config.actor_rollout_ref.rollout.multi_turn.tool_config_path
-        tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
+        ttrl = config.get("ttrl", {})
+        bfcl_mode = ttrl.get("enable", False) and ttrl.get("reward_mode", "math") == "bfcl"
+        if bfcl_mode and (
+            not isinstance(cls.max_parallel_calls, int)
+            or isinstance(cls.max_parallel_calls, bool)
+            or cls.max_parallel_calls < 1
+        ):
+            raise ValueError("BFCL multi_turn.max_parallel_calls must be a positive integer")
+        tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path and not bfcl_mode else []
         cls.tools = {tool.name: tool for tool in tool_list}
         cls.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
         cls.tool_parser = cls.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format)
@@ -114,48 +122,110 @@ class ToolAgentLoop(AgentLoopBase):
         cls.response_length = config.actor_rollout_ref.rollout.response_length
         cls.system_prompt = tokenizer.apply_chat_template([{}], add_generation_prompt=False, tokenize=True)
 
-    async def run(self, messages: List[Dict[str, Any]], sampling_params: Dict[str, Any]) -> AgentLoopOutput:
+    async def run(self, messages, sampling_params, bfcl_context=None) -> AgentLoopOutput:
+        session = None
+        if bfcl_context is not None:
+            from verl.utils.reward_score.ttrl_bfcl import BFCLSession
+
+            session = BFCLSession(bfcl_context)
+        try:
+            return await self._run(messages, sampling_params, session)
+        finally:
+            if session is not None:
+                session.close()
+
+    async def _run(self, messages, sampling_params, session=None) -> AgentLoopOutput:
         metrics = {}
         request_id = uuid4().hex
         prompt_ids = await self.loop.run_in_executor(
             None,
             lambda: self.tokenizer.apply_chat_template(
-                messages, tools=self.tool_schemas, add_generation_prompt=True, tokenize=True
+                messages,
+                tools=session.tool_schemas if session else self.tool_schemas,
+                add_generation_prompt=True,
+                tokenize=True,
             ),
         )
         response_mask = []
+        initial_prompt_length = len(prompt_ids)
+        if session and initial_prompt_length > self.prompt_length:
+            raise ValueError("BFCL prompt including tool schemas exceeds rollout.prompt_length")
+        termination = "completed"
 
         user_turns, assistant_turns = 0, 0
         while True:
             with simple_timer("generate_sequences", metrics):
+                params = dict(sampling_params)
+                if session:
+                    params["max_tokens"] = min(
+                        params.get("max_tokens", self.response_length), self.response_length - len(response_mask)
+                    )
                 response_ids = await self.server_manager.generate(
-                    request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params
+                    request_id=request_id, prompt_ids=prompt_ids, sampling_params=params
                 )
+            if not response_ids:
+                termination = "empty_response"
+                break
             prompt_ids += response_ids
             response_mask += [1] * len(response_ids)
             assistant_turns += 1
 
             # reach max response length
-            if len(response_mask) >= self.response_length:
+            if len(response_mask) > self.response_length or (
+                not session and len(response_mask) == self.response_length
+            ):
+                termination = "response_length"
                 break
 
             # reach max assistant turns
-            if self.max_assistant_turns and assistant_turns >= self.max_assistant_turns:
+            if not session and self.max_assistant_turns and assistant_turns >= self.max_assistant_turns:
                 break
 
             # no tool calls
-            tool_calls = await self.tool_parser.extract_tool_calls(response_ids)
-            if not tool_calls:
-                break
+            if session:
+                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
+                eos = getattr(self.tokenizer, "eos_token", None)
+                if eos and not response_text.rstrip().endswith(eos):
+                    termination = "response_length"
+                    break
+                if eos and response_text.rstrip().endswith(eos):
+                    response_text = response_text.rstrip()[: -len(eos)]
+                calls = session.parse_calls(response_text)
+                if calls == []:
+                    next_turn = session.finish_turn(response_text)
+                    if next_turn is None:
+                        break
+                    tool_responses = next_turn
+                elif calls is None:
+                    tool_responses = session.malformed_response()
+                elif len(calls) > self.max_parallel_calls:
+                    tool_responses = session.malformed_response(
+                        f"Use at most {self.max_parallel_calls} tool calls per response; "
+                        "split the remaining calls across steps."
+                    )
+                else:
+                    with simple_timer("tool_calls", metrics):
+                        tool_responses = await self.loop.run_in_executor(None, session.execute, calls)
+                if self.max_assistant_turns and assistant_turns >= self.max_assistant_turns:
+                    termination = "max_assistant_turns"
+                    break
+                tool_responses = [
+                    {**message, "content": self._truncate_tool_response(message["content"])}
+                    if message["role"] == "tool"
+                    else message
+                    for message in tool_responses
+                ]
+            else:
+                tool_calls = await self.tool_parser.extract_tool_calls(response_ids)
+                if not tool_calls:
+                    break
 
-            # call tools
-            tasks = []
-            for tool_call in tool_calls[: self.max_parallel_calls]:
-                tasks.append(self._call_tool(tool_call))
-            with simple_timer("tool_calls", metrics):
-                tool_responses = await asyncio.gather(*tasks)
-            if any(isinstance(item, Exception) for item in tool_responses):
-                break
+                # Native tools retain their existing parallel execution path.
+                tasks = [self._call_tool(tool_call) for tool_call in tool_calls[: self.max_parallel_calls]]
+                with simple_timer("tool_calls", metrics):
+                    tool_responses = await asyncio.gather(*tasks)
+                if any(isinstance(item, Exception) for item in tool_responses):
+                    break
 
             # append tool_response_ids
             tool_response_ids = await self.loop.run_in_executor(
@@ -173,10 +243,13 @@ class ToolAgentLoop(AgentLoopBase):
             if (self.max_user_turns and user_turns >= self.max_user_turns) or len(
                 response_mask
             ) >= self.response_length:
+                termination = (
+                    "max_user_turns" if self.max_user_turns and user_turns >= self.max_user_turns else "response_length"
+                )
                 break
 
-        response_ids = prompt_ids[-len(response_mask) :]
-        prompt_ids = prompt_ids[: len(prompt_ids) - len(response_mask)]
+        response_ids = prompt_ids[initial_prompt_length:]
+        prompt_ids = prompt_ids[:initial_prompt_length]
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -184,6 +257,7 @@ class ToolAgentLoop(AgentLoopBase):
             response_mask=response_mask[: self.response_length],
             num_turns=user_turns + assistant_turns + 1,
             metrics=metrics,
+            extra_fields={"bfcl_outcome": session.outcome(termination)} if session else {},
         )
         return output
 
@@ -205,6 +279,9 @@ class ToolAgentLoop(AgentLoopBase):
             if tool and instance_id:
                 await tool.release(instance_id)
 
+        return {"role": "tool", "content": self._truncate_tool_response(tool_response)}
+
+    def _truncate_tool_response(self, tool_response):
         if len(tool_response) > self.max_tool_response_length:
             if self.tool_response_truncate_side == "left":
                 tool_response = tool_response[: self.max_tool_response_length] + "...(truncated)"
@@ -214,10 +291,7 @@ class ToolAgentLoop(AgentLoopBase):
                 length = self.max_tool_response_length // 2
                 tool_response = tool_response[:length] + "...(truncated)..." + tool_response[-length:]
 
-        return {
-            "role": "tool",
-            "content": tool_response,
-        }
+        return tool_response
 
     @classmethod
     def get_tool_parser(cls, name: str) -> ToolParser:

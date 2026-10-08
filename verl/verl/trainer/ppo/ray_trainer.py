@@ -329,6 +329,14 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        ttrl = config.get("ttrl", {})
+        if ttrl.get("enable", False) and ttrl.get("reward_mode", "math") == "bfcl":
+            from verl.utils.reward_score.ttrl_bfcl import bfcl_reward
+
+            # The current BFCL module scores shared training groups only.
+            # Evaluate the frozen model with BFCL's existing CLI separately.
+            self.reward_fn = bfcl_reward
+            self.val_reward_fn = None
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -372,6 +380,7 @@ class RayPPOTrainer:
 
     def _validate_config(self):
         config = self.config
+        self._validate_ttrl_config()
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
         if config.actor_rollout_ref.actor.strategy == "megatron":
@@ -1034,6 +1043,179 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _validate_ttrl_config(self):
+        """Check the sampling contract before starting TTRL workers."""
+        ttrl = self.config.get("ttrl", {})
+        if not ttrl.get("enable", False):
+            return
+
+        reward_mode = ttrl.get("reward_mode", "math")
+        if reward_mode not in ("math", "bfcl"):
+            raise ValueError(f"Unsupported ttrl.reward_mode: {reward_mode!r}")
+        if reward_mode == "bfcl":
+            from verl.utils.reward_score.ttrl_consensus import validate_consensus_mode
+
+            if not ttrl.get("share_rollouts", False):
+                raise ValueError("BFCL consensus rewards require ttrl.share_rollouts=True")
+            rollout = self.config.actor_rollout_ref.rollout
+            consensus = ttrl.get("consensus", {})
+            mode = validate_consensus_mode(
+                consensus.get("mode", "observations" if rollout.multi_turn.enable else "calls")
+            )
+            if not rollout.multi_turn.enable and mode != "calls":
+                raise ValueError(
+                    "Single-turn BFCL inputs require ttrl.consensus.mode=calls; other modes require execution"
+                )
+            if rollout.multi_turn.enable:
+                if rollout.get("mode", "sync") != "async":
+                    raise ValueError("BFCL multi-turn requires rollout.mode=async and the existing AgentLoopManager")
+            if rollout.get("mode", "sync") == "async" and not self.config.get("data", {}).get("return_raw_chat", False):
+                raise ValueError("BFCL async generation requires data.return_raw_chat=True")
+            if self.config.get("reward_model", {}).get("enable", False):
+                raise ValueError("BFCL consensus rewards must not be replaced by an external reward model")
+
+        q_weight = ttrl.get("q_weight", {})
+        if q_weight.get("enabled", False):
+            from verl.trainer.ppo.ttrl_utils import validate_q_weight_config
+
+            validate_q_weight_config(q_weight)
+            if not ttrl.get("share_rollouts", False) or self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
+                raise ValueError("TTRL q weighting requires shared GRPO rollout groups")
+            if self.config.algorithm.get("use_kl_in_reward", False):
+                raise ValueError("TTRL q weighting requires use_kl_in_reward=False; use actor.use_kl_loss for KL")
+
+        rollout = self.config.actor_rollout_ref.rollout
+        n_samples = ttrl.get("n_samples_per_prompt", rollout.n)
+        n_votes = ttrl.get("n_votes_per_prompt", rollout.n)
+        for name, value in (
+            ("actor_rollout_ref.rollout.n", rollout.n),
+            ("ttrl.n_samples_per_prompt", n_samples),
+            ("ttrl.n_votes_per_prompt", n_votes),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if n_samples != rollout.n:
+            raise ValueError("ttrl.n_samples_per_prompt must equal actor_rollout_ref.rollout.n")
+        if n_votes < n_samples:
+            raise ValueError("ttrl.n_votes_per_prompt must be >= ttrl.n_samples_per_prompt")
+
+        if ttrl.get("share_rollouts", False):
+            if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
+                raise ValueError("ttrl.share_rollouts requires algorithm.adv_estimator=grpo")
+            if n_votes != n_samples or n_samples < 2:
+                raise ValueError(
+                    "ttrl.share_rollouts requires n_votes_per_prompt = n_samples_per_prompt = rollout.n >= 2"
+                )
+        elif rollout.get("mode", "sync") == "async" or (
+            rollout.name == "sglang" and rollout.multi_turn.enable
+        ):
+            raise ValueError("TTRL with async or SGLang multi-turn rollout requires ttrl.share_rollouts=True")
+
+    def _generate_training_rollouts(self, batch: DataProto, gen_batch: DataProto):
+        """Generate once, then reuse that output for TTRL voting and GRPO."""
+        rollout = self.config.actor_rollout_ref.rollout
+        ttrl = self.config.get("ttrl", {})
+        ttrl_enabled = ttrl.get("enable", False)
+        shared_rollouts = ttrl_enabled and ttrl.get("share_rollouts", False)
+
+        if ttrl_enabled and ttrl.get("reward_mode", "math") == "bfcl":
+            from verl.utils.reward_score.ttrl_bfcl import decode_bfcl_context
+
+            if self.async_rollout_mode and "raw_prompt" not in gen_batch.non_tensor_batch:
+                raise ValueError("BFCL AgentLoop requires raw_prompt messages from data.return_raw_chat=True")
+            fields = (
+                "functions", "initial_config", "involved_classes", "future_user_turns", "long_context",
+                "observable_state", "name_map", "function_schedule",
+            )
+            consensus = ttrl.get("consensus", {})
+            mode = consensus.get("mode", "observations" if rollout.multi_turn.enable else "calls")
+            contexts = []
+            for index, item in enumerate(batch.non_tensor_batch["extra_info"]):
+                context = decode_bfcl_context(item.get("bfcl", {}))
+                if bool(context.get("involved_classes")) != bool(rollout.multi_turn.enable):
+                    raise ValueError(
+                        "BFCL task type must match rollout.multi_turn.enable; separate single/multi-turn data"
+                    )
+                context = {key: context[key] for key in fields if key in context}
+                context["consensus_mode"] = mode
+                projection = consensus.get("observable_state", {})
+                if mode == "state" and projection:
+                    if any(isinstance(attributes, str) for attributes in projection.values()):
+                        raise ValueError("observable_state attributes must be lists, not strings")
+                    context["observable_state"] = {
+                        name: list(attributes)
+                        for name, attributes in projection.items()
+                        if name in context.get("involved_classes", [])
+                    }
+                if mode == "state" and not context.get("observable_state"):
+                    raise ValueError("State consensus requires an explicit observable_state projection for every task")
+                # The sync adapter and async session use the same representation.
+                batch.non_tensor_batch["extra_info"][index] = {**item, "bfcl": context}
+                contexts.append(context)
+            if self.async_rollout_mode:
+                gen_batch.non_tensor_batch["bfcl_context"] = np.array(contexts, dtype=object)
+                agent_name = "tool_agent" if rollout.multi_turn.enable else "single_turn_agent"
+                names = gen_batch.non_tensor_batch.get("agent_name")
+                if names is not None and np.any(names != agent_name):
+                    raise ValueError(f"BFCL task type requires agent_name={agent_name}")
+                gen_batch.non_tensor_batch["agent_name"] = np.array([agent_name] * len(batch), dtype=object)
+
+        uids = np.array([str(uuid.uuid4()) for _ in range(len(batch))], dtype=object)
+        batch.non_tensor_batch["uid"] = uids
+        # SGLang's sync multi-turn worker generates one trajectory per input row.
+        # The async agent manager already repeats prompts internally.
+        if not self.async_rollout_mode and rollout.name == "sglang" and rollout.multi_turn.enable:
+            gen_batch.non_tensor_batch["uid"] = uids
+            gen_batch = gen_batch.repeat(repeat_times=rollout.n, interleave=True)
+
+        if ttrl_enabled and not shared_rollouts:
+            # Preserve the original math recipe's larger voting pool.
+            n_votes = ttrl.get("n_votes_per_prompt", rollout.n)
+            gen_batch.meta_info.setdefault("kwargs", {})["n"] = n_votes
+            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+        elif self.async_rollout_mode:
+            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+        else:
+            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+
+        if ttrl_enabled:
+            from verl.trainer.ppo.ttrl_utils import apply_ttrl_gt, select_top_k_per_prompt
+
+            n_votes = ttrl.get("n_votes_per_prompt", rollout.n)
+            n_samples = ttrl.get("n_samples_per_prompt", rollout.n)
+            if len(gen_batch_output) != len(batch) * n_votes:
+                raise ValueError(
+                    f"Expected {len(batch) * n_votes} TTRL rollouts, got {len(gen_batch_output)}"
+                )
+            if ttrl.get("reward_mode", "math") == "bfcl":
+                from verl.utils.reward_score.ttrl_bfcl import apply_bfcl_rewards
+
+                if rollout.multi_turn.enable and "bfcl_outcome" not in gen_batch_output.non_tensor_batch:
+                    raise ValueError("BFCL multi-turn rewards require outcomes from the BFCL AgentLoop")
+                batch = apply_bfcl_rewards(batch, gen_batch_output, n_votes, self.tokenizer)
+            else:
+                batch = apply_ttrl_gt(batch, gen_batch_output, n_votes, self.tokenizer)
+            if not shared_rollouts:
+                gen_batch_output = select_top_k_per_prompt(gen_batch_output, n_votes, n_samples)
+
+        return batch, gen_batch_output
+
+    def _compute_ttrl_metrics(self, batch: DataProto):
+        if self.config.ttrl.get("reward_mode", "math") == "bfcl":
+            from verl.utils.reward_score.ttrl_bfcl import compute_bfcl_metrics
+
+            return compute_bfcl_metrics(batch)
+
+        from verl.trainer.ppo.ttrl_utils import apply_original_gt, compute_ttrl_metrics
+
+        batch = apply_original_gt(batch)
+        reward_tensor_original, _ = compute_reward(batch, self.reward_fn)
+        batch.batch["token_level_scores_original"] = reward_tensor_original
+        return compute_ttrl_metrics(
+            batch,
+            self.config.ttrl.get("n_samples_per_prompt", self.config.actor_rollout_ref.rollout.n),
+        )
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1075,11 +1257,6 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
-        repeat_sampling_sglang_grpo = (
-            self.config.actor_rollout_ref.rollout.name == "sglang"
-            and self.config.actor_rollout_ref.rollout.multi_turn.enable
-        )
-
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 do_profile = (
@@ -1119,40 +1296,12 @@ class RayPPOTrainer:
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
 
-                if repeat_sampling_sglang_grpo:
-                    uids_for_prompts = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
-                    batch.non_tensor_batch["uid"] = uids_for_prompts
-                    gen_batch.non_tensor_batch["uid"] = uids_for_prompts
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    assert np.array_equal(batch.non_tensor_batch["uid"], gen_batch.non_tensor_batch["uid"]), (
-                        "UIDs must be identical for SGLang rollout"
-                    )
-
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if self.config.get("ttrl", {}).get("enable", False):
-                            from verl.trainer.ppo.ttrl_utils import select_top_k_per_prompt, apply_ttrl_gt
-
-                            gen_batch.meta_info["kwargs"] = {"n": self.config.ttrl.n_votes_per_prompt}
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-
-                            assert len(gen_batch_output) == len(batch) * self.config.ttrl.n_votes_per_prompt
-
-                            batch = apply_ttrl_gt(batch, gen_batch_output, self.config.ttrl.n_votes_per_prompt, self.tokenizer)
-                            gen_batch_output = select_top_k_per_prompt(gen_batch_output, self.config.ttrl.n_votes_per_prompt, self.config.ttrl.n_samples_per_prompt)
-
-                            assert len(gen_batch_output) == len(batch) * self.config.ttrl.n_samples_per_prompt
-                        else:
-                            if not self.async_rollout_mode:
-                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                            else:
-                                # vllm should set async_rollout_mode to enable async rollout
-                                # sglang turns on async_rollout_mode by default
-                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        batch, gen_batch_output = self._generate_training_rollouts(batch, gen_batch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -1172,12 +1321,8 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    if not repeat_sampling_sglang_grpo:
-                        batch.non_tensor_batch["uid"] = np.array(
-                            [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                        )
-                        # repeat to align with repeated responses in rollout
-                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    # Repeat prompt metadata only after voting on the original prompt groups.
+                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                     batch = batch.union(gen_batch_output)
 
@@ -1291,6 +1436,11 @@ class RayPPOTrainer:
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             config=self.config.algorithm,
                         )
+                        if self.config.get("ttrl", {}).get("enable", False):
+                            from verl.trainer.ppo.ttrl_utils import apply_ttrl_q_weights
+
+                            weight_metrics = apply_ttrl_q_weights(batch, self.config.ttrl.get("q_weight", {}))
+                            metrics.update({f"train/{key}": value for key, value in weight_metrics.items()})
 
                     # update critic
                     if self.use_critic:
@@ -1309,14 +1459,9 @@ class RayPPOTrainer:
                         metrics.update(actor_output_metrics)
 
                     if self.config.get("ttrl", {}).get("enable", False):
-                        from verl.trainer.ppo.ttrl_utils import apply_original_gt, compute_ttrl_metrics
-                        batch = apply_original_gt(batch)
-                        reward_tensor_original, reward_extra_infos_dict_original = compute_reward(batch, self.reward_fn)
-                        batch.batch["token_level_scores_original"] = reward_tensor_original
-                        # Compute ttrl metrics
-                        ttrl_metrics = compute_ttrl_metrics(batch, self.config.ttrl.n_samples_per_prompt)
+                        ttrl_metrics = self._compute_ttrl_metrics(batch)
                         for key, value in ttrl_metrics.items():
-                                metrics.update({f"train/{key}": value})
+                            metrics.update({f"train/{key}": value})
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

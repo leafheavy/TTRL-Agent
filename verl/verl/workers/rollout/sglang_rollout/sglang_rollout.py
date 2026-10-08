@@ -979,6 +979,9 @@ class SGLangRollout(BaseRollout):
     ) -> dict:
         max_new_tokens = min(self.config.response_length, self.config.max_model_len - len(generation_prompt_ids) - 1)
         kwargs = sampling_params.copy()
+        max_new_tokens = min(max_new_tokens, kwargs.pop("max_tokens", max_new_tokens))
+        if max_new_tokens <= 0:
+            raise ValueError("Generation requires remaining context and response token budget")
         kwargs["max_new_tokens"] = max_new_tokens
         kwargs["n"] = 1  # group size is supported in preprocess
         output = await self._engine.async_generate(

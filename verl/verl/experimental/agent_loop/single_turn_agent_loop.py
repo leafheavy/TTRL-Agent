@@ -31,12 +31,32 @@ class SingleTurnAgentLoop(AgentLoopBase):
         self.prompt_length = config.actor_rollout_ref.rollout.prompt_length
         self.response_length = config.actor_rollout_ref.rollout.response_length
 
-    async def run(self, messages: List[Dict[str, Any]], sampling_params: Dict[str, Any]) -> AgentLoopOutput:
+    async def run(
+        self, messages: List[Dict[str, Any]], sampling_params: Dict[str, Any], bfcl_context=None
+    ) -> AgentLoopOutput:
         metrics = {}
         request_id = uuid4().hex
+        template_kwargs = {}
+        if bfcl_context is not None:
+            from verl.utils.reward_score.ttrl_bfcl import decode_bfcl_context
+
+            context = decode_bfcl_context(bfcl_context)
+            template_kwargs["tools"] = [
+                tool if "function" in tool else {"type": "function", "function": tool} for tool in context["functions"]
+            ]
         prompt_ids = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+            None,
+            lambda: self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=True, **template_kwargs
+            ),
         )
+        if bfcl_context is not None and len(prompt_ids) > self.prompt_length:
+            raise ValueError("BFCL prompt including tool schemas exceeds rollout.prompt_length")
+        if bfcl_context is not None:
+            sampling_params = dict(sampling_params)
+            sampling_params["max_tokens"] = min(
+                sampling_params.get("max_tokens", self.response_length), self.response_length
+            )
 
         with simple_timer("generate_sequences", metrics):
             response_ids = await self.server_manager.generate(

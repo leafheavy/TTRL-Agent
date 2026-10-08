@@ -24,7 +24,7 @@ import ray
 import torch
 from cachetools import LRUCache
 from omegaconf import DictConfig
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tensordict import TensorDict
 from transformers import AutoTokenizer
 
@@ -116,6 +116,7 @@ class AgentLoopOutput(BaseModel):
     response_mask: List[int]
     num_turns: int = 0
     metrics: AgentLoopMetrics
+    extra_fields: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentLoopBase(ABC):
@@ -220,19 +221,27 @@ class AgentLoopWorker:
 
         agent_names = batch.non_tensor_batch["agent_name"].repeat(n, axis=0)
         raw_prompts = batch.non_tensor_batch["raw_prompt"].repeat(n, axis=0)
-        for agent_name, messages in zip(agent_names, raw_prompts):
-            tasks.append(asyncio.create_task(self._run_agent_loop(agent_name, messages.tolist(), sampling_params)))
+        contexts = batch.non_tensor_batch.get("bfcl_context")
+        contexts = contexts.repeat(n, axis=0) if contexts is not None else [None] * len(agent_names)
+        for agent_name, messages, context in zip(agent_names, raw_prompts, contexts):
+            messages = messages.tolist() if hasattr(messages, "tolist") else messages
+            tasks.append(asyncio.create_task(self._run_agent_loop(agent_name, messages, sampling_params, context)))
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)
         return output
 
     async def _run_agent_loop(
-        self, agent_name: str, messages: List[Dict[str, Any]], sampling_params: Dict[str, Any]
+        self, agent_name: str, messages: List[Dict[str, Any]], sampling_params: Dict[str, Any], bfcl_context=None
     ) -> AgentLoopOutput:
         agent_loop_class = self.get_agent_loop_class(agent_name)
         agent_loop = agent_loop_class(self.config, self.server_manager, self.tokenizer)
-        output = await agent_loop.run(messages, sampling_params)
+        if bfcl_context is not None:
+            if agent_name not in ("tool_agent", "single_turn_agent"):
+                raise ValueError("BFCL contexts require tool_agent or single_turn_agent")
+            output = await agent_loop.run(messages, sampling_params, bfcl_context=bfcl_context)
+        else:
+            output = await agent_loop.run(messages, sampling_params)
         return output
 
     def get_agent_loop_class(self, agent_name: str) -> Type[AgentLoopBase]:
@@ -308,7 +317,12 @@ class AgentLoopWorker:
 
         num_turns = np.array([input.num_turns for input in inputs], dtype=np.int32)
         metrics = [input.metrics.model_dump() for input in inputs]
-        return DataProto(batch=batch, non_tensor_batch={"__num_turns__": num_turns}, meta_info={"metrics": metrics})
+        non_tensor_batch = {"__num_turns__": num_turns}
+        for key in {key for output in inputs for key in output.extra_fields}:
+            values = np.empty(len(inputs), dtype=object)
+            values[:] = [output.extra_fields.get(key) for output in inputs]
+            non_tensor_batch[key] = values
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"metrics": metrics})
 
 
 class AgentLoopManager:

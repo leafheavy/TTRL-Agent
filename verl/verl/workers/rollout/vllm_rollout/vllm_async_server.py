@@ -314,7 +314,11 @@ class AsyncvLLMServer(AsyncServerBase):
             return JSONResponse(content=generator.model_dump())
 
     async def generate(self, prompt_ids: List[int], sampling_params: Dict[str, Any], request_id: str) -> List[int]:
-        max_tokens = self.max_model_len - len(prompt_ids)
+        sampling_params = dict(sampling_params)
+        capacity = self.max_model_len - len(prompt_ids)
+        max_tokens = min(capacity, sampling_params.pop("max_tokens", capacity))
+        if max_tokens <= 0:
+            raise ValueError("Generation requires remaining context and response token budget")
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt = TokensPrompt(prompt_token_ids=prompt_ids)
         generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)

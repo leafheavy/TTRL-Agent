@@ -34,6 +34,17 @@ from verl.utils.model import compute_position_id_with_mask
 logger = logging.getLogger(__name__)
 
 
+def bfcl_chat_template_kwargs(example):
+    context = example.get("extra_info", {}).get("bfcl")
+    if context is None:
+        return {}
+    from verl.utils.reward_score.ttrl_bfcl import decode_bfcl_context
+
+    functions = decode_bfcl_context(context)["functions"]
+    tools = [tool if "function" in tool else {"type": "function", "function": tool} for tool in functions]
+    return {"tools": tools}
+
+
 def collate_fn(data_list: list[dict]) -> dict:
     """
     Collate a batch of sample dicts into batched tensors and arrays.
@@ -155,7 +166,7 @@ class RLHFDataset(Dataset):
                 def doc2len(doc) -> int:
                     messages = self._build_messages(doc)
                     raw_prompt = self.processor.apply_chat_template(
-                        messages, add_generation_prompt=True, tokenize=False
+                        messages, add_generation_prompt=True, tokenize=False, **bfcl_chat_template_kwargs(doc)
                     )
                     images = (
                         [process_image(image) for image in messages.pop(image_key)] if image_key in messages else None
@@ -169,7 +180,9 @@ class RLHFDataset(Dataset):
             else:
 
                 def doc2len(doc) -> int:
-                    return len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True))
+                    return len(tokenizer.apply_chat_template(
+                        doc[prompt_key], add_generation_prompt=True, **bfcl_chat_template_kwargs(doc)
+                    ))
 
             self.dataframe = self.dataframe.filter(
                 lambda doc: doc2len(doc) <= self.max_prompt_length,
@@ -224,14 +237,20 @@ class RLHFDataset(Dataset):
         row_dict: dict = self.dataframe[item]
         messages = self._build_messages(row_dict)
         model_inputs = {}
+        chat_template_kwargs = bfcl_chat_template_kwargs(row_dict)
 
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
 
             if self.enable_thinking is not None:
-                raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, enable_thinking=self.enable_thinking)
+                raw_prompt = self.processor.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False,
+                    enable_thinking=self.enable_thinking, **chat_template_kwargs
+                )
             else:
-                raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+                raw_prompt = self.processor.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False, **chat_template_kwargs
+                )
             multi_modal_data = {}
 
             images = None
@@ -261,9 +280,14 @@ class RLHFDataset(Dataset):
 
         else:
             if self.enable_thinking is not None:
-                raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, enable_thinking=self.enable_thinking)
+                raw_prompt = self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False,
+                    enable_thinking=self.enable_thinking, **chat_template_kwargs
+                )
             else:
-                raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+                raw_prompt = self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False, **chat_template_kwargs
+                )
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")

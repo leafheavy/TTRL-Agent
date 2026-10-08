@@ -70,6 +70,12 @@ def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
     Returns:
         An instance of the specified reward manager class.
     """
+    ttrl = config.get("ttrl", {})
+    if ttrl.get("enable", False) and ttrl.get("reward_mode", "math") == "bfcl":
+        from verl.utils.reward_score.ttrl_bfcl import bfcl_reward
+
+        return bfcl_reward
+
     from verl.workers.reward_manager import get_reward_manager_cls
 
     # The list of pre-defined reward managers are defined in `verl/workers/reward_manager/`:
