@@ -3,7 +3,8 @@
 Reuse BFCL's Qwen extractor and TTRL's voting rule. Function schemas must be
 the JSON schemas shown to the model, supplied in extra_info.bfcl.functions.
 BFCLSession reuses the original executor with a separate namespace per rollout.
-Neither reward construction nor the session reads benchmark reference answers.
+Consensus reward construction and BFCLSession never read reference answers.
+The explicitly enabled BFCLSupervisedReward below is a separate labeled baseline.
 """
 
 import json
@@ -208,6 +209,7 @@ class BFCLSession:
         self.instances = {}
         self.long_context = bool(context.get("long_context", False))
         self.calls, self.observations = [], []
+        self.execution_trace = [[]] if context.get("record_execution_trace", False) else None
         self.explicit_no_call, self.episode_completed = False, False
         self.num_calls, self.parse_errors, self.execution_errors = 0, 0, 0
         self.blocked = False
@@ -254,7 +256,10 @@ class BFCLSession:
                 if any(not key.isidentifier() or keyword.iskeyword(key) for key in arguments):
                     raise ValueError("BFCL keyword parameters must be Python identifiers")
                 decoded.append({self.name_map.get(name, name): arguments})
-            results, self.instances = self._execute(self.convert_calls(decoded))
+            executable_calls = self.convert_calls(decoded)
+            results, self.instances = self._execute(executable_calls)
+            if self.execution_trace is not None:
+                self.execution_trace[self.turn_index].append(deepcopy(executable_calls))
             if len(results) != len(calls):
                 raise ValueError("BFCL executor returned an unexpected number of observations")
             self.num_calls += len(calls)
@@ -288,6 +293,8 @@ class BFCLSession:
             self.episode_completed = True
             return None
         self.turn_index += 1
+        if self.execution_trace is not None:
+            self.execution_trace.append([])
         messages = self.future_user_turns.pop(0)
         functions = self.function_schedule.get(str(self.turn_index), self.function_schedule.get(self.turn_index, []))
         if functions:
@@ -313,7 +320,7 @@ class BFCLSession:
             "final_state": self._state() if complete and self.consensus_mode == "state" else None,
         }
         key = consensus_key(trace, self.consensus_mode) if complete else None
-        return {
+        outcome = {
             "key": key,
             "valid": key is not None,
             "consensus_mode": self.consensus_mode,
@@ -322,6 +329,10 @@ class BFCLSession:
             "parse_errors": self.parse_errors,
             "execution_errors": self.execution_errors,
         }
+        if self.execution_trace is not None:
+            outcome["execution_trace"] = deepcopy(self.execution_trace)
+            outcome["episode_completed"] = self.episode_completed
+        return outcome
 
     def close(self):
         with self.lock:
@@ -329,6 +340,134 @@ class BFCLSession:
                 self.namespace.pop(key, None)
             self.instances.clear()
             self.closed = True
+
+
+def validate_bfcl_supervised_config(config):
+    """The labeled baseline uses the same multi-turn AgentLoop, with one rollout group."""
+    if config.get("ttrl", {}).get("enable", False):
+        raise ValueError("BFCL supervised reward and TTRL must be run separately")
+    if config.get("ttrl", {}).get("q_weight", {}).get("enabled", False):
+        raise ValueError("Disable TTRL q weighting for the BFCL supervised GRPO baseline")
+    rollout = config.actor_rollout_ref.rollout
+    if not rollout.multi_turn.enable or rollout.get("mode", "sync") != "async":
+        raise ValueError("BFCL supervised Agent GRPO requires multi_turn.enable=True and rollout.mode=async")
+    if not config.data.get("return_raw_chat", False):
+        raise ValueError("BFCL supervised AgentLoop requires data.return_raw_chat=True")
+    if (
+        config.algorithm.adv_estimator != "grpo"
+        or isinstance(rollout.n, bool)
+        or not isinstance(rollout.n, int)
+        or rollout.n < 2
+    ):
+        raise ValueError("BFCL supervised training requires GRPO with rollout.n >= 2")
+    if config.get("reward_model", {}).get("enable", False):
+        raise ValueError("BFCL official pass/fail cannot be replaced by a reward model")
+    if config.trainer.get("val_before_train", True) or config.trainer.get("test_freq", -1) > 0:
+        raise ValueError(
+            "BFCL Agent runs require val_before_train=False and test_freq=-1; evaluate the frozen model with BFCL CLI"
+        )
+
+
+@lru_cache(maxsize=None)
+def get_bfcl_reference_category(category, answer_dir=None):
+    """Only the supervised branch calls this loader; do not attach labels to prompts."""
+    from pathlib import Path
+
+    from bfcl_eval.constants.eval_config import POSSIBLE_ANSWER_PATH, PROMPT_PATH
+    from bfcl_eval.utils import find_file_by_category, load_file
+
+    if category not in ("multi_turn_base", "multi_turn_miss_func", "multi_turn_miss_param", "multi_turn_long_context"):
+        raise ValueError(
+            f"The supervised Agent baseline currently supports the four local multi-turn categories: {category}"
+        )
+    prompts = load_file(find_file_by_category(category, PROMPT_PATH), use_lock=False)
+    answers = load_file(
+        find_file_by_category(category, Path(answer_dir) if answer_dir else POSSIBLE_ANSWER_PATH), use_lock=False
+    )
+    if len(prompts) != len(answers):
+        raise ValueError(f"BFCL prompt and answer counts differ for {category}")
+    # Match the official eval runner: full prompt/answer files are aligned by
+    # position, then subset by prompt ID. Answer IDs need not equal prompt IDs.
+    references = {}
+    for prompt, answer in zip(prompts, answers):
+        case_id, ground_truth = prompt["id"], answer["ground_truth"]
+        if (
+            case_id in references
+            or not isinstance(ground_truth, list)
+            or any(
+                not isinstance(turn, list) or any(not isinstance(call, str) for call in turn) for turn in ground_truth
+            )
+        ):
+            raise ValueError(f"Invalid or duplicate BFCL reference: {case_id}")
+        references[case_id] = (prompt, ground_truth)
+    return references
+
+
+class BFCLSupervisedReward:
+    """Official multi-turn pass/fail on the generated trace, with no second sampling.
+
+    The official checker replays model calls and reference calls in isolated
+    simulator instances. Labels stay in this scorer and never reach AgentLoop.
+    """
+
+    def __init__(self, answer_dir=None):
+        self.answer_dir = str(answer_dir) if answer_dir else None
+
+    def _reference(self, item):
+        case_id = item["index"]
+        category = case_id.rsplit("_", 1)[0]
+        references = get_bfcl_reference_category(category, self.answer_dir)
+        if case_id not in references:
+            raise ValueError(f"No official BFCL reference for {case_id}")
+        entry, ground_truth = references[case_id]
+        context = decode_bfcl_context(item["bfcl"])
+        for field in ("initial_config", "involved_classes"):
+            if context.get(field, {}) != entry.get(field, {}):
+                raise ValueError(f"Training input differs from the installed BFCL reference: {case_id}/{field}")
+        if len(context.get("future_user_turns", [])) + 1 != len(ground_truth):
+            raise ValueError(f"Training dialogue and BFCL reference turn counts differ: {case_id}")
+        return entry, ground_truth, category
+
+    def score_outcome(self, item, outcome):
+        entry, ground_truth, category = self._reference(item)
+        if not isinstance(outcome, dict) or "execution_trace" not in outcome:
+            raise ValueError("Supervised BFCL scoring requires the AgentLoop execution trace")
+        trace = outcome["execution_trace"]
+        if (
+            outcome["termination"] != "completed"
+            or not outcome.get("episode_completed", False)
+            or len(trace) != len(ground_truth)
+        ):
+            return 0.0
+        from bfcl_eval.eval_checker.multi_turn_eval.multi_turn_checker import multi_turn_checker
+
+        execute_fn, _ = get_bfcl_runtime()
+        model_name = f"bfcl_grpo_{uuid4().hex}"
+        # is_evaL_run=True adds _eval to both model and ground-truth namespaces.
+        keys = [
+            re.sub(r"[-./:]", "_", f"{prefix}_eval_{entry['id']}_{name}_instance")
+            for prefix in (model_name, model_name + "_ground_truth")
+            for name in entry["involved_classes"]
+        ]
+        try:
+            result = multi_turn_checker(deepcopy(trace), deepcopy(ground_truth), deepcopy(entry), category, model_name)
+            return float(result["valid"])
+        finally:
+            for key in keys:
+                execute_fn.__globals__.pop(key, None)
+
+    def __call__(self, data, return_dict=False):
+        outcomes = data.non_tensor_batch.get("bfcl_outcome")
+        if outcomes is None or len(outcomes) != len(data):
+            raise ValueError("BFCL supervised reward requires one AgentLoop outcome per rollout")
+        rewards = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        prompt_length = data.batch["prompts"].shape[-1]
+        for row, outcome in enumerate(outcomes):
+            mask = data.batch["response_mask"][row].bool() & data.batch["attention_mask"][row, prompt_length:].bool()
+            positions = torch.nonzero(mask, as_tuple=True)[0]
+            if len(positions):
+                rewards[row, positions[-1]] = self.score_outcome(data.non_tensor_batch["extra_info"][row], outcome)
+        return {"reward_tensor": rewards, "reward_extra_info": {}} if return_dict else rewards
 
 
 def apply_bfcl_rewards(batch, gen_batch_output, n, tokenizer):

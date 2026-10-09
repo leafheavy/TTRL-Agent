@@ -207,6 +207,40 @@ class TestTTRLRollouts(unittest.TestCase):
         self.utils.apply_ttrl_gt.assert_not_called()
         self.utils.select_top_k_per_prompt.assert_not_called()
 
+    def test_supervised_bfcl_reuses_agent_dispatch_without_voting_or_reference_inputs(self):
+        trainer = self.make_trainer(asynchronous=True, multi_turn=True, enabled=False)
+        trainer.config["bfcl_supervised"] = Config(enabled=True)
+        trainer.config["trainer"] = Config(val_before_train=False, test_freq=-1)
+        trainer._validate_ttrl_config()
+        contexts = [
+            {"functions": [], "initial_config": {}, "involved_classes": ["MathAPI"], "ground_truth": "hidden"}
+        ] * 2
+        batch = Batch(["a", "b"], {"extra_info": np.array([{"bfcl": context} for context in contexts], dtype=object)})
+        prompts = Batch(["a", "b"], {"raw_prompt": np.array([[{"role": "user", "content": "task"}]] * 2, dtype=object)})
+        returned, generated = trainer._generate_training_rollouts(batch, prompts)
+        self.assertIs(returned, batch)
+        self.assertEqual(len(generated), 8)
+        trainer.async_rollout_manager.generate_sequences.assert_called_once_with(prompts)
+        self.assertTrue(prompts.non_tensor_batch["bfcl_context"][0]["record_execution_trace"])
+        self.assertNotIn("ground_truth", prompts.non_tensor_batch["bfcl_context"][0])
+        self.utils.apply_ttrl_gt.assert_not_called()
+        self.utils.select_top_k_per_prompt.assert_not_called()
+
+    def test_supervised_bfcl_rejects_mixed_rewards_single_turn_and_non_grpo(self):
+        for change in ("mixed", "single_turn", "non_grpo"):
+            trainer = self.make_trainer(asynchronous=True, multi_turn=True, enabled=False)
+            trainer.config["bfcl_supervised"] = Config(enabled=True)
+            trainer.config["trainer"] = Config(val_before_train=False, test_freq=-1)
+            if change == "mixed":
+                trainer.config.ttrl["enable"] = True
+            elif change == "single_turn":
+                trainer.config.actor_rollout_ref.rollout.multi_turn["enable"] = False
+            else:
+                trainer.config.algorithm["adv_estimator"] = "remax"
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                trainer._validate_ttrl_config()
+            trainer.async_rollout_manager.generate_sequences.assert_not_called()
+
     def test_bfcl_requires_shared_supported_dispatch_without_external_rewards(self):
         cases = (
             ({"shared": False}, {}, "share_rollouts=True"),

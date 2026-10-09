@@ -33,6 +33,9 @@ def main(config):
 
 # Define a function to run the PPO-like training process
 def run_ppo(config) -> None:
+    from verl.utils.gradient_diagnostics import validate_gradient_recording
+
+    validate_gradient_recording(config)
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration

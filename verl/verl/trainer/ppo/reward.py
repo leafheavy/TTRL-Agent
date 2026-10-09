@@ -71,6 +71,13 @@ def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
         An instance of the specified reward manager class.
     """
     ttrl = config.get("ttrl", {})
+    supervised = config.get("bfcl_supervised", {})
+    if supervised.get("enabled", False):
+        if ttrl.get("enable", False):
+            raise ValueError("BFCL supervised reward and TTRL must be run separately")
+        from verl.utils.reward_score.ttrl_bfcl import BFCLSupervisedReward
+
+        return BFCLSupervisedReward(supervised.get("answer_dir"))
     if ttrl.get("enable", False) and ttrl.get("reward_mode", "math") == "bfcl":
         from verl.utils.reward_score.ttrl_bfcl import bfcl_reward
 

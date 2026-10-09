@@ -16,7 +16,7 @@ from jsonschema.exceptions import SchemaError
 from data.preprocess import make_bfcl_map_fn
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
-from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
+from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage, compute_policy_loss
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import compute_reward, load_reward_manager
 from verl.trainer.ppo.ttrl_utils import _majority_vote, apply_ttrl_q_weights, validate_q_weight_config
@@ -472,6 +472,177 @@ class TestBFCLSession(unittest.TestCase):
         observations.finish_turn("[]")
         self.assertTrue(calls.outcome("completed")["valid"])
         self.assertFalse(observations.outcome("completed")["valid"])
+
+
+@unittest.skipUnless(BFCL_RUNTIME_AVAILABLE, "Requires BFCL's existing data helpers")
+class TestBFCLReferenceLoading(unittest.TestCase):
+    def setUp(self):
+        from bfcl_eval import utils as bfcl_utils
+
+        constants = ModuleType("bfcl_eval.constants.eval_config")
+        constants.PROMPT_PATH, constants.POSSIBLE_ANSWER_PATH = "prompts", "answers"
+        modules = patch.dict(sys.modules, {constants.__name__: constants})
+        modules.start()
+        self.addCleanup(modules.stop)
+        finder = patch.object(
+            bfcl_utils, "find_file_by_category", side_effect=lambda category, root: str(root), create=True
+        )
+        finder.start()
+        self.addCleanup(finder.stop)
+        self.prompts = [{"id": "multi_turn_base_0"}, {"id": "multi_turn_base_1"}]
+        self.answers = [
+            {"id": "answer_99", "ground_truth": [["mkdir(dir_name='A')"]]},
+            {"id": "answer_88", "ground_truth": [[]]},
+        ]
+        loader = patch.object(
+            bfcl_utils, "load_file",
+            side_effect=lambda path, **kwargs: self.prompts if path == "prompts" else self.answers,
+        )
+        self.loader = loader.start()
+        self.addCleanup(loader.stop)
+        ttrl_bfcl.get_bfcl_reference_category.cache_clear()
+        self.addCleanup(ttrl_bfcl.get_bfcl_reference_category.cache_clear)
+
+    def test_references_align_by_position_then_prompt_id_and_are_cached(self):
+        references = ttrl_bfcl.get_bfcl_reference_category("multi_turn_base")
+        self.assertEqual(references["multi_turn_base_0"][1], [["mkdir(dir_name='A')"]])
+        self.assertEqual(references["multi_turn_base_1"][1], [[]])
+        self.assertIs(ttrl_bfcl.get_bfcl_reference_category("multi_turn_base"), references)
+        self.assertEqual(self.loader.call_count, 2)
+        ttrl_bfcl.get_bfcl_reference_category("multi_turn_base", "custom_answers")
+        self.assertEqual(self.loader.call_args.args, ("custom_answers",))
+
+    def test_incompatible_or_malformed_reference_files_fail(self):
+        self.answers.pop()
+        with self.assertRaisesRegex(ValueError, "counts differ"):
+            ttrl_bfcl.get_bfcl_reference_category("multi_turn_base")
+        self.answers.append({"ground_truth": ["not a nested turn"]})
+        with self.assertRaisesRegex(ValueError, "Invalid or duplicate"):
+            ttrl_bfcl.get_bfcl_reference_category("multi_turn_base")
+        self.answers[-1]["ground_truth"] = [[]]
+        self.prompts[-1]["id"] = self.prompts[0]["id"]
+        with self.assertRaisesRegex(ValueError, "Invalid or duplicate"):
+            ttrl_bfcl.get_bfcl_reference_category("multi_turn_base")
+
+
+@unittest.skipUnless(BFCL_RUNTIME_AVAILABLE, "Requires the existing BFCL executor and checker package")
+class TestBFCLSupervisedReward(unittest.TestCase):
+    def setUp(self):
+        runtime = patch.object(
+            ttrl_bfcl, "get_bfcl_runtime", return_value=(execute_multi_turn_func_call, convert_to_function_call)
+        )
+        runtime.start()
+        self.addCleanup(runtime.stop)
+        decoder = patch.object(ttrl_bfcl, "get_bfcl_decoder", return_value=parser_stub)
+        decoder.start()
+        self.addCleanup(decoder.stop)
+        self.entry = {"id": "multi_turn_base_0", "initial_config": {}, "involved_classes": ["GorillaFileSystem"]}
+        self.references = patch.object(ttrl_bfcl, "get_bfcl_reference_category", return_value={
+            self.entry["id"]: (self.entry, [["mkdir(dir_name='A')"]])
+        })
+        self.reference_mock = self.references.start()
+        self.addCleanup(self.references.stop)
+        self.reward = ttrl_bfcl.BFCLSupervisedReward()
+        self.item = {"index": self.entry["id"], "bfcl": fs_context()}
+
+    def outcome(self, folder="A", **options):
+        session = ttrl_bfcl.BFCLSession(fs_context(record_execution_trace=True, **options))
+        try:
+            if folder is not None:
+                session.execute([fs_call("mkdir", dir_name=folder)])
+            session.finish_turn("done")
+            return session.outcome("completed")
+        finally:
+            session.close()
+
+    def test_official_checker_scores_correct_wrong_and_repeated_rollouts_with_cleanup(self):
+        namespace = execute_multi_turn_func_call.__globals__
+        before = {key for key in namespace if key.endswith("_instance")}
+        self.assertEqual(self.reward.score_outcome(self.item, self.outcome("A")), 1)
+        self.assertEqual(self.reward.score_outcome(self.item, self.outcome("B")), 0)
+        self.assertEqual(self.reward.score_outcome(self.item, self.outcome("A")), 1)
+        self.assertEqual({key for key in namespace if key.endswith("_instance")}, before)
+
+    def test_empty_reference_turn_is_not_gated_by_consensus_validity(self):
+        self.reference_mock.return_value = {self.entry["id"]: (self.entry, [[]])}
+        outcome = self.outcome(None)
+        self.assertFalse(outcome["valid"])
+        self.assertEqual(self.reward.score_outcome(self.item, outcome), 1)
+
+    def test_terminal_reward_uses_model_mask_and_rewards_correct_minority(self):
+        wrong, correct = self.outcome("B"), self.outcome("A")
+        batch = Batch(4, tensors={
+            "responses": torch.zeros(4, 4, dtype=torch.long), "prompts": torch.zeros(4, 2, dtype=torch.long),
+            "attention_mask": torch.ones(4, 6, dtype=torch.long),
+            "response_mask": torch.tensor([[1, 0, 1, 0]] * 4),
+        }, metadata={"bfcl_outcome": np.array([wrong, wrong, wrong, correct], dtype=object),
+                     "extra_info": np.array([self.item] * 4, dtype=object)})
+        scores = self.reward(batch)
+        self.assertEqual(scores.sum(-1).tolist(), [0, 0, 0, 1])
+        self.assertEqual(scores[3].tolist(), [0, 0, 1, 0])
+        advantage, _ = compute_grpo_outcome_advantage(scores, batch.batch["response_mask"], np.array(["task"] * 4))
+        self.assertLess(advantage[0, 0].item(), 0)
+        self.assertGreater(advantage[3, 0].item(), 0)
+
+    def test_incomplete_episode_is_zero_and_missing_trace_is_an_error(self):
+        incomplete = self.outcome("A")
+        incomplete["termination"] = "response_length"
+        self.assertEqual(self.reward.score_outcome(self.item, incomplete), 0)
+        with self.assertRaisesRegex(ValueError, "execution trace"):
+            self.reward.score_outcome(self.item, {"termination": "completed"})
+
+    def test_official_ground_truth_controls_the_pure_policy_gradient(self):
+        batch = Batch(2, tensors={
+            "responses": torch.zeros(2, 3, dtype=torch.long), "prompts": torch.zeros(2, 2, dtype=torch.long),
+            "attention_mask": torch.ones(2, 5, dtype=torch.long),
+            "response_mask": torch.tensor([[1, 0, 1]] * 2),
+        }, metadata={"bfcl_outcome": np.array([self.outcome("A"), self.outcome("B")], dtype=object),
+                     "extra_info": np.array([self.item] * 2, dtype=object)})
+
+        def policy_gradient():
+            rewards = self.reward(batch)
+            scores = rewards.sum(-1).tolist()
+            advantages, _ = compute_grpo_outcome_advantage(
+                rewards, batch.batch["response_mask"], np.array(["same_task"] * 2)
+            )
+            parameter = torch.tensor(0.25, requires_grad=True)
+            log_probs = torch.log_softmax(torch.stack((parameter, -parameter)), dim=0).unsqueeze(-1).expand(2, 3)
+            loss, *_ = compute_policy_loss(
+                log_probs.detach(), log_probs, advantages, batch.batch["response_mask"], cliprange=0.2
+            )
+            return scores, torch.autograd.grad(loss, parameter)[0]
+
+        original_scores, original_gradient = policy_gradient()
+        self.reference_mock.return_value = {self.entry["id"]: (self.entry, [["mkdir(dir_name='B')"]])}
+        changed_scores, changed_gradient = policy_gradient()
+        self.assertEqual(original_scores, [1, 0])
+        self.assertEqual(changed_scores, [0, 1])
+        self.assertNotEqual(original_gradient.item(), 0)
+        torch.testing.assert_close(original_gradient, -changed_gradient)
+
+    def test_execution_trace_keeps_user_turn_and_generation_step_boundaries(self):
+        session = ttrl_bfcl.BFCLSession(fs_context(
+            record_execution_trace=True, future_user_turns=[[{"role": "user", "content": "where am I?"}]]
+        ))
+        try:
+            session.execute([fs_call("mkdir", dir_name="A")])
+            session.execute([fs_call("cd", folder="A")])
+            session.finish_turn("done")
+            session.execute([fs_call("pwd")])
+            session.finish_turn("done")
+            self.assertEqual(session.outcome("completed")["execution_trace"], [
+                [["mkdir(dir_name='A')"], ["cd(folder='A')"]], [["pwd()"]]
+            ])
+        finally:
+            session.close()
+
+    def test_input_reference_mismatch_and_mixed_reward_modes_fail(self):
+        changed = {**self.item, "bfcl": fs_context(initial_config={"changed": True})}
+        with self.assertRaisesRegex(ValueError, "differs"):
+            self.reward.score_outcome(changed, self.outcome())
+        config = Config(ttrl=Config(enable=True), bfcl_supervised=Config(enabled=True))
+        with self.assertRaisesRegex(ValueError, "separately"):
+            load_reward_manager(config, tokenizer=None, num_examine=0)
 
 
 class Config(dict):

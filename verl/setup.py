@@ -49,6 +49,7 @@ GEO_REQUIRES = ["mathruler", "torchvision", "qwen_vl_utils"]
 GPU_REQUIRES = ["liger-kernel", "flash-attn"]
 MATH_REQUIRES = ["math-verify"]  # Add math-verify as an optional dependency
 BFCL_REQUIRES = ["jsonschema>=4"]  # Reuse an existing bfcl_eval installation for decoding
+DIAGNOSTICS_REQUIRES = ["matplotlib>=3.7"]
 VLLM_REQUIRES = ["tensordict<=0.6.2", "vllm<=0.8.5"]
 SGLANG_REQUIRES = [
     "tensordict<=0.6.2",
@@ -65,6 +66,7 @@ extras_require = {
     "gpu": GPU_REQUIRES,
     "math": MATH_REQUIRES,
     "bfcl": BFCL_REQUIRES,
+    "diagnostics": DIAGNOSTICS_REQUIRES,
     "vllm": VLLM_REQUIRES,
     "sglang": SGLANG_REQUIRES,
     "trl": TRL_REQUIRES,

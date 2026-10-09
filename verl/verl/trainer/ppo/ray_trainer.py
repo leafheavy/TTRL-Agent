@@ -337,6 +337,9 @@ class RayPPOTrainer:
             # Evaluate the frozen model with BFCL's existing CLI separately.
             self.reward_fn = bfcl_reward
             self.val_reward_fn = None
+        elif config.get("bfcl_supervised", {}).get("enabled", False):
+            # Use the same frozen-model BFCL CLI evaluation as the TTRL branch.
+            self.val_reward_fn = None
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -1046,6 +1049,10 @@ class RayPPOTrainer:
     def _validate_ttrl_config(self):
         """Check the sampling contract before starting TTRL workers."""
         ttrl = self.config.get("ttrl", {})
+        if self.config.get("bfcl_supervised", {}).get("enabled", False):
+            from verl.utils.reward_score.ttrl_bfcl import validate_bfcl_supervised_config
+
+            validate_bfcl_supervised_config(self.config)
         if not ttrl.get("enable", False):
             return
 
@@ -1117,8 +1124,9 @@ class RayPPOTrainer:
         ttrl = self.config.get("ttrl", {})
         ttrl_enabled = ttrl.get("enable", False)
         shared_rollouts = ttrl_enabled and ttrl.get("share_rollouts", False)
+        bfcl_supervised = self.config.get("bfcl_supervised", {}).get("enabled", False)
 
-        if ttrl_enabled and ttrl.get("reward_mode", "math") == "bfcl":
+        if bfcl_supervised or (ttrl_enabled and ttrl.get("reward_mode", "math") == "bfcl"):
             from verl.utils.reward_score.ttrl_bfcl import decode_bfcl_context
 
             if self.async_rollout_mode and "raw_prompt" not in gen_batch.non_tensor_batch:
@@ -1128,7 +1136,9 @@ class RayPPOTrainer:
                 "observable_state", "name_map", "function_schedule",
             )
             consensus = ttrl.get("consensus", {})
-            mode = consensus.get("mode", "observations" if rollout.multi_turn.enable else "calls")
+            mode = "calls" if bfcl_supervised else consensus.get(
+                "mode", "observations" if rollout.multi_turn.enable else "calls"
+            )
             contexts = []
             for index, item in enumerate(batch.non_tensor_batch["extra_info"]):
                 context = decode_bfcl_context(item.get("bfcl", {}))
@@ -1138,6 +1148,8 @@ class RayPPOTrainer:
                     )
                 context = {key: context[key] for key in fields if key in context}
                 context["consensus_mode"] = mode
+                if bfcl_supervised:
+                    context["record_execution_trace"] = True
                 projection = consensus.get("observable_state", {})
                 if mode == "state" and projection:
                     if any(isinstance(attributes, str) for attributes in projection.values()):
@@ -1454,6 +1466,19 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            if self.config.actor_rollout_ref.actor.get("gradient_record", {}).get("enabled", False):
+                                ttrl = self.config.get("ttrl", {})
+                                batch.meta_info["gradient_record"] = {
+                                    "step": self.global_steps,
+                                    "reward_source": "bfcl_supervised"
+                                    if self.config.get("bfcl_supervised", {}).get("enabled", False)
+                                    else "ttrl_" + ttrl.get("reward_mode", "math")
+                                    if ttrl.get("enable", False)
+                                    else "configured_grpo_reward",
+                                    "model_path": str(self.config.actor_rollout_ref.model.path),
+                                    "norm_adv_by_std": norm_adv_by_std_in_grpo,
+                                    "rollout_n": self.config.actor_rollout_ref.rollout.n,
+                                }
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

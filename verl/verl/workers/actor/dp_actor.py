@@ -17,6 +17,7 @@
 Single Process Actor
 """
 
+import hashlib
 import itertools
 import logging
 import os
@@ -78,6 +79,7 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        self.gradient_record_config = self.config.get("gradient_record", {})
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
@@ -375,12 +377,151 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
+    def _backward_micro_batches(self, micro_batches, temperature, metrics, *, policy_only=False):
+        """Reuse the training objective and accumulation for an optional policy-only pass."""
+        for data in micro_batches:
+            micro_batch_metrics = {}
+            if isinstance(data, DataProto):
+                data = {**data.batch.to(get_device_id()), **data.non_tensor_batch}
+            elif isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, torch.Tensor):
+                        data[k] = v.to(get_device_id())
+                    elif k == "multi_modal_inputs" and v is not None:
+                        data[k] = [{kk: vv.to(get_device_id()) for kk, vv in item_dict.items()} for item_dict in v]
+            else:
+                data = data.to(get_device_id())
+            response_mask = data["response_mask"]
+            old_log_prob = data["old_log_probs"]
+            advantages = data["advantages"]
+
+            clip_ratio = self.config.clip_ratio
+            clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+            clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+            entropy_coeff = self.config.entropy_coeff
+            loss_agg_mode = self.config.loss_agg_mode
+            entropy, log_prob = self._forward_micro_batch(
+                micro_batch=data, temperature=temperature, calculate_entropy=entropy_coeff != 0
+            )
+            loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+            if loss_mode == "vanilla":
+                pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                    old_log_prob=old_log_prob,
+                    log_prob=log_prob,
+                    advantages=advantages,
+                    response_mask=response_mask,
+                    cliprange=clip_ratio,
+                    cliprange_low=clip_ratio_low,
+                    cliprange_high=clip_ratio_high,
+                    clip_ratio_c=self.config.get("clip_ratio_c", 3.0),
+                    loss_agg_mode=loss_agg_mode,
+                )
+            else:
+                policy_loss_fn = get_policy_loss_fn(loss_mode)
+                pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                    old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, self.config
+                )
+
+            policy_loss = pg_loss
+            if not policy_only:
+                if entropy_coeff != 0:
+                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    policy_loss = policy_loss - entropy_loss * entropy_coeff
+                if self.config.use_kl_loss:
+                    kld = kl_penalty(
+                        logprob=log_prob, ref_logprob=data["ref_log_prob"], kl_penalty=self.config.kl_loss_type
+                    )
+                    kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                    micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item()
+                    micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+            if self.config.use_dynamic_bsz:
+                loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+            else:
+                loss = policy_loss / self.gradient_accumulation
+            loss.backward()
+            if not policy_only:
+                micro_batch_metrics.update(
+                    {
+                        "actor/pg_loss": pg_loss.detach().item(),
+                        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                        "actor/ppo_kl": ppo_kl.detach().item(),
+                        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                    }
+                )
+                append_to_dict(metrics, micro_batch_metrics)
+
+    def _record_policy_gradient(self, micro_batches, mini_batch, temperature, metadata, epoch, batch_idx):
+        from verl.utils.gradient_diagnostics import save_policy_gradient
+
+        world_size = torch.distributed.get_world_size()
+        if world_size > 1:
+            for parameter in self.actor_module.parameters():
+                if not parameter.requires_grad:
+                    continue
+                is_sharded = getattr(parameter, "_is_flat_param", False) or any(
+                    placement.is_shard() for placement in getattr(parameter, "placements", ())
+                )
+                if not is_sharded:
+                    raise ValueError(
+                        "Multi-GPU gradient recording requires all trainable parameters to be FSDP-sharded"
+                    )
+        if "multi_modal_inputs" in getattr(mini_batch, "non_tensor_batch", {}):
+            raise ValueError("Policy gradient recording currently supports text/tool trajectories only")
+        devices = [get_device_id()] if self.device_name != "cpu" else []
+        # A second, disposable backward avoids FSDP's unsupported autograd.grad
+        # and reentrant backward on an already-resharded forward graph.
+        # Restore RNG so dropout and the actual training update are unchanged.
+        with torch.random.fork_rng(devices=devices, device_type=self.device_name):
+            digest = hashlib.sha256(torch.random.get_rng_state().numpy().tobytes())
+            if devices:
+                digest.update(getattr(torch, self.device_name).get_rng_state(devices[0]).cpu().numpy().tobytes())
+            self.actor_optimizer.zero_grad()
+            self._backward_micro_batches(micro_batches, temperature, None, policy_only=True)
+            tensors = mini_batch.batch if isinstance(mini_batch, DataProto) else mini_batch
+            objective = {
+                "norm_adv_by_std": metadata["norm_adv_by_std"],
+                "rollout_n": metadata["rollout_n"],
+                "temperature": temperature,
+                "loss_agg_mode": self.config.loss_agg_mode,
+                "clip_ratio": self.config.clip_ratio,
+                "clip_ratio_low": self.config.clip_ratio_low,
+                "clip_ratio_high": self.config.clip_ratio_high,
+                "clip_ratio_c": self.config.get("clip_ratio_c", 3.0),
+                "mini_batch_size_per_rank": self.config.ppo_mini_batch_size,
+                "micro_batch_size": self.config.ppo_micro_batch_size_per_gpu,
+                "dynamic_bsz": self.config.use_dynamic_bsz,
+            }
+            save_policy_gradient(
+                self.actor_module,
+                tensors,
+                {
+                    **metadata,
+                    "epoch": epoch,
+                    "minibatch": batch_idx,
+                    "objective": objective,
+                    "rng_fingerprint": digest.hexdigest(),
+                },
+                self.gradient_record_config["output_dir"],
+                rank=torch.distributed.get_rank(),
+                world_size=world_size,
+            )
+        self.actor_optimizer.zero_grad()
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        gradient_metadata = data.meta_info.get("gradient_record")
+        record_gradient = False
+        if self.gradient_record_config.get("enabled", False):
+            from verl.utils.gradient_diagnostics import recording_due
+
+            if gradient_metadata is None:
+                raise ValueError("Policy gradient recording requires trainer step metadata")
+            record_gradient = recording_due(self.gradient_record_config, gradient_metadata["step"])
 
         select_keys = [
             "responses",
@@ -446,105 +587,12 @@ class DataParallelPPOActor(BasePPOActor):
                     # split batch into micro_batches
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
+                if record_gradient:
+                    self._record_policy_gradient(
+                        micro_batches, mini_batch, temperature, gradient_metadata, epoch, batch_idx
+                    )
                 self.actor_optimizer.zero_grad()
-
-                for data in micro_batches:
-                    micro_batch_metrics = {}
-
-                    # Support all hardwares
-                    if isinstance(data, DataProto):
-                        data = {**data.batch.to(get_device_id()), **data.non_tensor_batch}
-                    elif isinstance(data, dict):
-                        for k, v in data.items():
-                            if isinstance(v, torch.Tensor):
-                                data[k] = v.to(get_device_id())
-                            elif k == "multi_modal_inputs" and v is not None:
-                                data[k] = [
-                                    {kk: vv.to(get_device_id()) for kk, vv in item_dict.items()} for item_dict in v
-                                ]
-                            else:
-                                data[k] = v
-                    else:
-                        data = data.to(get_device_id())  # actor device is cpu when using offload
-                    response_mask = data["response_mask"]
-                    old_log_prob = data["old_log_probs"]
-                    advantages = data["advantages"]
-
-                    clip_ratio = self.config.clip_ratio
-                    clip_ratio_low = (
-                        self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
-                    )
-                    clip_ratio_high = (
-                        self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
-                    )
-                    clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
-                    entropy_coeff = self.config.entropy_coeff
-                    loss_agg_mode = self.config.loss_agg_mode
-
-                    # all return: (bsz, response_length)
-                    calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy
-                    )
-
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-
-                    if self.config.policy_loss.loss_mode == "vanilla":
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            cliprange=clip_ratio,
-                            cliprange_low=clip_ratio_low,
-                            cliprange_high=clip_ratio_high,
-                            clip_ratio_c=clip_ratio_c,
-                            loss_agg_mode=loss_agg_mode,
-                        )
-                    else:
-                        policy_loss_fn = get_policy_loss_fn(loss_mode)
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                            old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, self.config
-                        )
-
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
-                    else:
-                        policy_loss = pg_loss
-
-                    if self.config.use_kl_loss:
-                        ref_log_prob = data["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
-                        )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item()
-                        micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
-
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
-                    else:
-                        loss = policy_loss / self.gradient_accumulation
-                    loss.backward()
-
-                    micro_batch_metrics.update(
-                        {
-                            "actor/pg_loss": pg_loss.detach().item(),
-                            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-                            "actor/ppo_kl": ppo_kl.detach().item(),
-                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                        }
-                    )
-                    append_to_dict(metrics, micro_batch_metrics)
+                self._backward_micro_batches(micro_batches, temperature, metrics)
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}

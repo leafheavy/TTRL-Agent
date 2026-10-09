@@ -105,7 +105,9 @@ class ToolAgentLoop(AgentLoopBase):
         cls.tool_response_truncate_side = config.actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
         tool_config_path = config.actor_rollout_ref.rollout.multi_turn.tool_config_path
         ttrl = config.get("ttrl", {})
-        bfcl_mode = ttrl.get("enable", False) and ttrl.get("reward_mode", "math") == "bfcl"
+        bfcl_mode = (ttrl.get("enable", False) and ttrl.get("reward_mode", "math") == "bfcl") or config.get(
+            "bfcl_supervised", {}
+        ).get("enabled", False)
         if bfcl_mode and (
             not isinstance(cls.max_parallel_calls, int)
             or isinstance(cls.max_parallel_calls, bool)

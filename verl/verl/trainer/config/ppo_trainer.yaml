@@ -175,6 +175,19 @@ actor_rollout_ref:
     # Gradient clipping for actor updates
     grad_clip: 1.0
 
+    # Optional exact policy-gradient recording, before regularizers and gradient clipping.
+    gradient_record:
+
+      # The BFCL-Agent experiment commands enable this by default.
+      enabled: false
+
+      # Derived from the run directory; only enabled is needed to toggle recording.
+      # All ranks share this directory on multi-GPU jobs.
+      output_dir: ${trainer.default_local_dir}/gradients
+
+      # Record step 1 and every N trainer steps, including each PPO optimizer minibatch.
+      interval: 10
+
     # PPO clip ratio
     clip_ratio: 0.2
 

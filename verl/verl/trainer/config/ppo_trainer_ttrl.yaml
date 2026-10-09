@@ -6,6 +6,13 @@ defaults:
   - ppo_trainer
   - _self_
 
+# Separate labeled BFCL-Agent GRPO baseline; never combine with TTRL.
+bfcl_supervised:
+  enabled: false
+
+  # null reads possible_answer from the existing bfcl_eval installation.
+  answer_dir: null
+
 ttrl:
   # Whether to enable TTRL, refer to (https://arxiv.org/abs/2504.16084)
   enable: false
