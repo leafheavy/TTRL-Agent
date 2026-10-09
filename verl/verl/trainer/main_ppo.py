@@ -36,6 +36,14 @@ def run_ppo(config) -> None:
     from verl.utils.gradient_diagnostics import validate_gradient_recording
 
     validate_gradient_recording(config)
+    ttrl = config.get("ttrl", {})
+    if config.get("bfcl_supervised", {}).get("enabled", False) or (
+        ttrl.get("enable", False) and ttrl.get("reward_mode", "math") == "bfcl"
+    ):
+        from verl.benchmark_runtime.client import RuntimeClient
+
+        health = RuntimeClient.from_config(config.get("benchmark_runtime")).health(expected_backend="bfcl")
+        print(f"BFCL runtime ready: {health}")
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration

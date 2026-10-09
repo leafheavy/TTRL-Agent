@@ -6,11 +6,17 @@ defaults:
   - ppo_trainer
   - _self_
 
+# JSON-only environment boundary, shared by benchmark adapters.
+# BFCL imports/execution/checking run in a separately activated bfcl venv.
+benchmark_runtime:
+  endpoint: null
+  timeout_s: 120
+
 # Separate labeled BFCL-Agent GRPO baseline; never combine with TTRL.
 bfcl_supervised:
   enabled: false
 
-  # null reads possible_answer from the existing bfcl_eval installation.
+  # null reads possible_answer inside the separate BFCL runtime environment.
   answer_dir: null
 
 ttrl:

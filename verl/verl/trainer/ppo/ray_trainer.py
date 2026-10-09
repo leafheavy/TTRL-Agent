@@ -1204,7 +1204,9 @@ class RayPPOTrainer:
 
                 if rollout.multi_turn.enable and "bfcl_outcome" not in gen_batch_output.non_tensor_batch:
                     raise ValueError("BFCL multi-turn rewards require outcomes from the BFCL AgentLoop")
-                batch = apply_bfcl_rewards(batch, gen_batch_output, n_votes, self.tokenizer)
+                batch = apply_bfcl_rewards(
+                    batch, gen_batch_output, n_votes, self.tokenizer, self.config.get("benchmark_runtime")
+                )
             else:
                 batch = apply_ttrl_gt(batch, gen_batch_output, n_votes, self.tokenizer)
             if not shared_rollouts:

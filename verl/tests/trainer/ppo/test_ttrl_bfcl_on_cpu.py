@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 import sys
 import unittest
@@ -14,6 +15,7 @@ import torch
 from jsonschema.exceptions import SchemaError
 
 from data.preprocess import make_bfcl_map_fn
+from verl.benchmark_runtime import bfcl_adapter as bfcl_backend
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
 from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage, compute_policy_loss
@@ -24,13 +26,17 @@ from verl.utils.dataset.rl_dataset import bfcl_chat_template_kwargs
 from verl.utils.reward_score import ttrl_bfcl
 from verl.utils.reward_score.ttrl_consensus import consensus_key, vote_consensus
 
-try:
-    from bfcl_eval.eval_checker.multi_turn_eval.multi_turn_utils import execute_multi_turn_func_call
-    from bfcl_eval.model_handler.utils import convert_to_function_call
-except ImportError:
-    BFCL_RUNTIME_AVAILABLE = False
-else:
-    BFCL_RUNTIME_AVAILABLE = True
+# Direct official-library integration tests must be explicitly run in the BFCL venv.
+BFCL_RUNTIME_AVAILABLE = False
+if os.environ.get("BFCL_IN_PROCESS_TESTS") == "1":
+    try:
+        from bfcl_eval.eval_checker.multi_turn_eval.multi_turn_utils import execute_multi_turn_func_call
+        from bfcl_eval.model_handler.utils import convert_to_function_call
+    except ImportError:
+        pass
+    else:
+        BFCL_RUNTIME_AVAILABLE = True
+
 
 FUNCTIONS = [
     {
@@ -121,21 +127,36 @@ def make_batches(responses, n):
     return batch, generated
 
 
+class AdapterClientStub:
+    """Existing algorithm tests replace the transport, not production imports."""
+
+    def call(self, method, **params):
+        return getattr(bfcl_backend.Adapter(), method)(**params)
+
+
+def mock_transport(test):
+    transport = patch.object(ttrl_bfcl.RuntimeClient, "from_config", return_value=AdapterClientStub())
+    transport.start()
+    test.addCleanup(transport.stop)
+
+
 class TestBFCLRewards(unittest.TestCase):
     def setUp(self):
+        mock_transport(self)
         self.decoder = Mock(side_effect=parser_stub)
-        self.decoder_patch = patch.object(ttrl_bfcl, "get_bfcl_decoder", return_value=self.decoder)
+        self.decoder_patch = patch.object(bfcl_backend, "get_bfcl_decoder", return_value=self.decoder)
         self.decoder_patch.start()
         self.addCleanup(self.decoder_patch.stop)
 
     def vote(self, responses, functions=FUNCTIONS):
-        validators = ttrl_bfcl._function_validators(functions)
+        validators = bfcl_backend._function_validators(functions)
         keys = []
         for response in responses:
-            calls = ttrl_bfcl.decode_bfcl_calls(response, validators, self.decoder)
+            calls = bfcl_backend.decode_bfcl_calls(response, validators, self.decoder)
             keys.append(
                 consensus_key({"calls": calls, "explicit_no_call": response.strip() == "[]"}, "calls")
-                if calls is not None else None
+                if calls is not None
+                else None
             )
         return vote_consensus(keys)
 
@@ -272,12 +293,21 @@ class TestBFCLRewards(unittest.TestCase):
 
 class TestTrajectoryConsensus(unittest.TestCase):
     def test_action_observation_and_final_state_define_different_equivalence_relations(self):
-        first = {"calls": [{"name": "add", "arguments": {"sku": "A", "quantity": 2}}],
-                 "observations": [{"ok": True}], "final_state": {"cart": {"A": 2}}}
-        other_item = {"calls": [{"name": "add", "arguments": {"sku": "B", "quantity": 2}}],
-                      "observations": [{"ok": True}], "final_state": {"cart": {"B": 2}}}
-        split = {"calls": [{"name": "add", "arguments": {"sku": "A", "quantity": 1}}] * 2,
-                 "observations": [{"ok": True}] * 2, "final_state": {"cart": {"A": 2}}}
+        first = {
+            "calls": [{"name": "add", "arguments": {"sku": "A", "quantity": 2}}],
+            "observations": [{"ok": True}],
+            "final_state": {"cart": {"A": 2}},
+        }
+        other_item = {
+            "calls": [{"name": "add", "arguments": {"sku": "B", "quantity": 2}}],
+            "observations": [{"ok": True}],
+            "final_state": {"cart": {"B": 2}},
+        }
+        split = {
+            "calls": [{"name": "add", "arguments": {"sku": "A", "quantity": 1}}] * 2,
+            "observations": [{"ok": True}] * 2,
+            "final_state": {"cart": {"A": 2}},
+        }
         self.assertNotEqual(consensus_key(first, "calls"), consensus_key(other_item, "calls"))
         self.assertEqual(consensus_key(first, "observations"), consensus_key(other_item, "observations"))
         self.assertNotEqual(consensus_key(first, "observations"), consensus_key(split, "observations"))
@@ -330,16 +360,16 @@ def fs_call(name, **arguments):
 class TestBFCLSession(unittest.TestCase):
     def setUp(self):
         self.runtime_patch = patch.object(
-            ttrl_bfcl, "get_bfcl_runtime", return_value=(execute_multi_turn_func_call, convert_to_function_call)
+            bfcl_backend, "get_bfcl_runtime", return_value=(execute_multi_turn_func_call, convert_to_function_call)
         )
         self.runtime_patch.start()
         self.addCleanup(self.runtime_patch.stop)
-        self.decoder_patch = patch.object(ttrl_bfcl, "get_bfcl_decoder", return_value=parser_stub)
+        self.decoder_patch = patch.object(bfcl_backend, "get_bfcl_decoder", return_value=parser_stub)
         self.decoder_patch.start()
         self.addCleanup(self.decoder_patch.stop)
 
     def session(self, **overrides):
-        session = ttrl_bfcl.BFCLSession(fs_context(**overrides))
+        session = bfcl_backend.BFCLSession(fs_context(**overrides))
         self.addCleanup(session.close)
         return session
 
@@ -426,7 +456,8 @@ class TestBFCLSession(unittest.TestCase):
 
     def test_final_state_ignores_intermediate_user_turn_states_and_wording(self):
         options = {
-            "consensus_mode": "state", "observable_state": {"GorillaFileSystem": ["root"]},
+            "consensus_mode": "state",
+            "observable_state": {"GorillaFileSystem": ["root"]},
             "future_user_turns": [[{"role": "user", "content": "finish the task"}]],
         }
         first, second = self.session(**options), self.session(**options)
@@ -495,58 +526,62 @@ class TestBFCLReferenceLoading(unittest.TestCase):
             {"id": "answer_88", "ground_truth": [[]]},
         ]
         loader = patch.object(
-            bfcl_utils, "load_file",
+            bfcl_utils,
+            "load_file",
             side_effect=lambda path, **kwargs: self.prompts if path == "prompts" else self.answers,
         )
         self.loader = loader.start()
         self.addCleanup(loader.stop)
-        ttrl_bfcl.get_bfcl_reference_category.cache_clear()
-        self.addCleanup(ttrl_bfcl.get_bfcl_reference_category.cache_clear)
+        bfcl_backend.get_bfcl_reference_category.cache_clear()
+        self.addCleanup(bfcl_backend.get_bfcl_reference_category.cache_clear)
 
     def test_references_align_by_position_then_prompt_id_and_are_cached(self):
-        references = ttrl_bfcl.get_bfcl_reference_category("multi_turn_base")
+        references = bfcl_backend.get_bfcl_reference_category("multi_turn_base")
         self.assertEqual(references["multi_turn_base_0"][1], [["mkdir(dir_name='A')"]])
         self.assertEqual(references["multi_turn_base_1"][1], [[]])
-        self.assertIs(ttrl_bfcl.get_bfcl_reference_category("multi_turn_base"), references)
+        self.assertIs(bfcl_backend.get_bfcl_reference_category("multi_turn_base"), references)
         self.assertEqual(self.loader.call_count, 2)
-        ttrl_bfcl.get_bfcl_reference_category("multi_turn_base", "custom_answers")
+        bfcl_backend.get_bfcl_reference_category("multi_turn_base", "custom_answers")
         self.assertEqual(self.loader.call_args.args, ("custom_answers",))
 
     def test_incompatible_or_malformed_reference_files_fail(self):
         self.answers.pop()
         with self.assertRaisesRegex(ValueError, "counts differ"):
-            ttrl_bfcl.get_bfcl_reference_category("multi_turn_base")
+            bfcl_backend.get_bfcl_reference_category("multi_turn_base")
         self.answers.append({"ground_truth": ["not a nested turn"]})
         with self.assertRaisesRegex(ValueError, "Invalid or duplicate"):
-            ttrl_bfcl.get_bfcl_reference_category("multi_turn_base")
+            bfcl_backend.get_bfcl_reference_category("multi_turn_base")
         self.answers[-1]["ground_truth"] = [[]]
         self.prompts[-1]["id"] = self.prompts[0]["id"]
         with self.assertRaisesRegex(ValueError, "Invalid or duplicate"):
-            ttrl_bfcl.get_bfcl_reference_category("multi_turn_base")
+            bfcl_backend.get_bfcl_reference_category("multi_turn_base")
 
 
 @unittest.skipUnless(BFCL_RUNTIME_AVAILABLE, "Requires the existing BFCL executor and checker package")
 class TestBFCLSupervisedReward(unittest.TestCase):
     def setUp(self):
+        mock_transport(self)
         runtime = patch.object(
-            ttrl_bfcl, "get_bfcl_runtime", return_value=(execute_multi_turn_func_call, convert_to_function_call)
+            bfcl_backend, "get_bfcl_runtime", return_value=(execute_multi_turn_func_call, convert_to_function_call)
         )
         runtime.start()
         self.addCleanup(runtime.stop)
-        decoder = patch.object(ttrl_bfcl, "get_bfcl_decoder", return_value=parser_stub)
+        decoder = patch.object(bfcl_backend, "get_bfcl_decoder", return_value=parser_stub)
         decoder.start()
         self.addCleanup(decoder.stop)
         self.entry = {"id": "multi_turn_base_0", "initial_config": {}, "involved_classes": ["GorillaFileSystem"]}
-        self.references = patch.object(ttrl_bfcl, "get_bfcl_reference_category", return_value={
-            self.entry["id"]: (self.entry, [["mkdir(dir_name='A')"]])
-        })
+        self.references = patch.object(
+            bfcl_backend,
+            "get_bfcl_reference_category",
+            return_value={self.entry["id"]: (self.entry, [["mkdir(dir_name='A')"]])},
+        )
         self.reference_mock = self.references.start()
         self.addCleanup(self.references.stop)
         self.reward = ttrl_bfcl.BFCLSupervisedReward()
         self.item = {"index": self.entry["id"], "bfcl": fs_context()}
 
     def outcome(self, folder="A", **options):
-        session = ttrl_bfcl.BFCLSession(fs_context(record_execution_trace=True, **options))
+        session = bfcl_backend.BFCLSession(fs_context(record_execution_trace=True, **options))
         try:
             if folder is not None:
                 session.execute([fs_call("mkdir", dir_name=folder)])
@@ -571,12 +606,19 @@ class TestBFCLSupervisedReward(unittest.TestCase):
 
     def test_terminal_reward_uses_model_mask_and_rewards_correct_minority(self):
         wrong, correct = self.outcome("B"), self.outcome("A")
-        batch = Batch(4, tensors={
-            "responses": torch.zeros(4, 4, dtype=torch.long), "prompts": torch.zeros(4, 2, dtype=torch.long),
-            "attention_mask": torch.ones(4, 6, dtype=torch.long),
-            "response_mask": torch.tensor([[1, 0, 1, 0]] * 4),
-        }, metadata={"bfcl_outcome": np.array([wrong, wrong, wrong, correct], dtype=object),
-                     "extra_info": np.array([self.item] * 4, dtype=object)})
+        batch = Batch(
+            4,
+            tensors={
+                "responses": torch.zeros(4, 4, dtype=torch.long),
+                "prompts": torch.zeros(4, 2, dtype=torch.long),
+                "attention_mask": torch.ones(4, 6, dtype=torch.long),
+                "response_mask": torch.tensor([[1, 0, 1, 0]] * 4),
+            },
+            metadata={
+                "bfcl_outcome": np.array([wrong, wrong, wrong, correct], dtype=object),
+                "extra_info": np.array([self.item] * 4, dtype=object),
+            },
+        )
         scores = self.reward(batch)
         self.assertEqual(scores.sum(-1).tolist(), [0, 0, 0, 1])
         self.assertEqual(scores[3].tolist(), [0, 0, 1, 0])
@@ -592,12 +634,19 @@ class TestBFCLSupervisedReward(unittest.TestCase):
             self.reward.score_outcome(self.item, {"termination": "completed"})
 
     def test_official_ground_truth_controls_the_pure_policy_gradient(self):
-        batch = Batch(2, tensors={
-            "responses": torch.zeros(2, 3, dtype=torch.long), "prompts": torch.zeros(2, 2, dtype=torch.long),
-            "attention_mask": torch.ones(2, 5, dtype=torch.long),
-            "response_mask": torch.tensor([[1, 0, 1]] * 2),
-        }, metadata={"bfcl_outcome": np.array([self.outcome("A"), self.outcome("B")], dtype=object),
-                     "extra_info": np.array([self.item] * 2, dtype=object)})
+        batch = Batch(
+            2,
+            tensors={
+                "responses": torch.zeros(2, 3, dtype=torch.long),
+                "prompts": torch.zeros(2, 2, dtype=torch.long),
+                "attention_mask": torch.ones(2, 5, dtype=torch.long),
+                "response_mask": torch.tensor([[1, 0, 1]] * 2),
+            },
+            metadata={
+                "bfcl_outcome": np.array([self.outcome("A"), self.outcome("B")], dtype=object),
+                "extra_info": np.array([self.item] * 2, dtype=object),
+            },
+        )
 
         def policy_gradient():
             rewards = self.reward(batch)
@@ -621,18 +670,19 @@ class TestBFCLSupervisedReward(unittest.TestCase):
         torch.testing.assert_close(original_gradient, -changed_gradient)
 
     def test_execution_trace_keeps_user_turn_and_generation_step_boundaries(self):
-        session = ttrl_bfcl.BFCLSession(fs_context(
-            record_execution_trace=True, future_user_turns=[[{"role": "user", "content": "where am I?"}]]
-        ))
+        session = bfcl_backend.BFCLSession(
+            fs_context(record_execution_trace=True, future_user_turns=[[{"role": "user", "content": "where am I?"}]])
+        )
         try:
             session.execute([fs_call("mkdir", dir_name="A")])
             session.execute([fs_call("cd", folder="A")])
             session.finish_turn("done")
             session.execute([fs_call("pwd")])
             session.finish_turn("done")
-            self.assertEqual(session.outcome("completed")["execution_trace"], [
-                [["mkdir(dir_name='A')"], ["cd(folder='A')"]], [["pwd()"]]
-            ])
+            self.assertEqual(
+                session.outcome("completed")["execution_trace"],
+                [[["mkdir(dir_name='A')"], ["cd(folder='A')"]], [["pwd()"]]],
+            )
         finally:
             session.close()
 
@@ -710,13 +760,18 @@ def loop_config(**overrides):
 @unittest.skipUnless(BFCL_RUNTIME_AVAILABLE, "Requires the existing BFCL executor package")
 class TestBFCLAgentLoop(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        session = patch.object(
+            ttrl_bfcl, "BFCLSession", side_effect=lambda context, config=None: bfcl_backend.BFCLSession(context)
+        )
+        session.start()
+        self.addCleanup(session.stop)
         ToolAgentLoop._class_initialized = False
         self.runtime_patch = patch.object(
-            ttrl_bfcl, "get_bfcl_runtime", return_value=(execute_multi_turn_func_call, convert_to_function_call)
+            bfcl_backend, "get_bfcl_runtime", return_value=(execute_multi_turn_func_call, convert_to_function_call)
         )
         self.runtime_patch.start()
         self.addCleanup(self.runtime_patch.stop)
-        self.decoder_patch = patch.object(ttrl_bfcl, "get_bfcl_decoder", return_value=parser_stub)
+        self.decoder_patch = patch.object(bfcl_backend, "get_bfcl_decoder", return_value=parser_stub)
         self.decoder_patch.start()
         self.addCleanup(self.decoder_patch.stop)
 

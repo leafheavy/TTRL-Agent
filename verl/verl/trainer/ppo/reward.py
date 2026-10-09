@@ -77,7 +77,7 @@ def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
             raise ValueError("BFCL supervised reward and TTRL must be run separately")
         from verl.utils.reward_score.ttrl_bfcl import BFCLSupervisedReward
 
-        return BFCLSupervisedReward(supervised.get("answer_dir"))
+        return BFCLSupervisedReward(supervised.get("answer_dir"), config.get("benchmark_runtime"))
     if ttrl.get("enable", False) and ttrl.get("reward_mode", "math") == "bfcl":
         from verl.utils.reward_score.ttrl_bfcl import bfcl_reward
 

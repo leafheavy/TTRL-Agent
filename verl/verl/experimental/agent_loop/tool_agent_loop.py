@@ -127,14 +127,15 @@ class ToolAgentLoop(AgentLoopBase):
     async def run(self, messages, sampling_params, bfcl_context=None) -> AgentLoopOutput:
         session = None
         if bfcl_context is not None:
+            from verl.benchmark_runtime.client import open_remote_session
             from verl.utils.reward_score.ttrl_bfcl import BFCLSession
 
-            session = BFCLSession(bfcl_context)
+            session = await open_remote_session(bfcl_context, self.config.get("benchmark_runtime"), BFCLSession)
         try:
             return await self._run(messages, sampling_params, session)
         finally:
             if session is not None:
-                session.close()
+                await self.loop.run_in_executor(None, session.close)
 
     async def _run(self, messages, sampling_params, session=None) -> AgentLoopOutput:
         metrics = {}
@@ -192,18 +193,20 @@ class ToolAgentLoop(AgentLoopBase):
                     break
                 if eos and response_text.rstrip().endswith(eos):
                     response_text = response_text.rstrip()[: -len(eos)]
-                calls = session.parse_calls(response_text)
+                calls = await self.loop.run_in_executor(None, session.parse_calls, response_text)
                 if calls == []:
-                    next_turn = session.finish_turn(response_text)
+                    next_turn = await self.loop.run_in_executor(None, session.finish_turn, response_text)
                     if next_turn is None:
                         break
                     tool_responses = next_turn
                 elif calls is None:
-                    tool_responses = session.malformed_response()
+                    tool_responses = await self.loop.run_in_executor(None, session.malformed_response)
                 elif len(calls) > self.max_parallel_calls:
-                    tool_responses = session.malformed_response(
+                    tool_responses = await self.loop.run_in_executor(
+                        None,
+                        session.malformed_response,
                         f"Use at most {self.max_parallel_calls} tool calls per response; "
-                        "split the remaining calls across steps."
+                        "split the remaining calls across steps.",
                     )
                 else:
                     with simple_timer("tool_calls", metrics):
@@ -253,13 +256,14 @@ class ToolAgentLoop(AgentLoopBase):
         response_ids = prompt_ids[initial_prompt_length:]
         prompt_ids = prompt_ids[:initial_prompt_length]
 
+        outcome = await self.loop.run_in_executor(None, session.outcome, termination) if session else None
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
             num_turns=user_turns + assistant_turns + 1,
             metrics=metrics,
-            extra_fields={"bfcl_outcome": session.outcome(termination)} if session else {},
+            extra_fields={"bfcl_outcome": outcome} if session else {},
         )
         return output
 
