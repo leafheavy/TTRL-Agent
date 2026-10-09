@@ -25,6 +25,13 @@ depending on shell-variable inheritance. Startup checks the backend before Ray
 or model allocation. No fallback imports BFCL into the training process.
 The documented loopback endpoint supports the current single-node recipe.
 
+For BFCL multi-turn runs, keep `rollout.mode=async`,
+`data.return_raw_chat=True` and GRPO enabled. Tool schemas and interactions come
+from the remote session, so `multi_turn.tool_config_path` and
+`multi_turn.interaction_config_path` can remain null. The trainer validates the
+explicit benchmark runtime config for this path; ordinary multi-turn tools
+still require a native tool or interaction config.
+
 Each rollout owns a separate session. Requests within one session are serialized;
 different sessions retain separate simulator namespaces. `close_session` is
 idempotent, and abandoned idle sessions expire after `--session-ttl-s` (3600
@@ -61,7 +68,7 @@ unlabeled TTRL reward do not read reference answers.
 Run the transport and environment-boundary checks without Ray or a GPU:
 
 ```bash
-python -m unittest discover -s tests/benchmark_runtime -p test_runtime_on_cpu.py -v
+python -m unittest discover -s tests/benchmark_runtime -p 'test_*_on_cpu.py' -v
 ```
 
 These tests create two temporary virtual environments and install a tiny BFCL
@@ -72,3 +79,8 @@ official BFCL package on the GPU node. The existing in-process official-library
 checks in `tests/trainer/ppo/test_ttrl_bfcl_on_cpu.py` require activating the BFCL
 environment and opting in with `BFCL_IN_PROCESS_TESTS=1` (plus that test suite's
 training test dependencies).
+
+The config regression tests compile and execute the trainer's actual validation
+methods without importing Ray or GPU workers. They cover the smoke and supervised
+remote-tool paths, reject invalid runtime/AgentLoop settings and preserve the
+native multi-turn guards while blocking BFCL dependency imports.

@@ -534,15 +534,27 @@ class RayPPOTrainer:
                 "validation gen temperature should be greater than 0 when enabling do_sample"
             )
 
-        # check multi_turn with tool config
+        # BFCL sessions supply their schemas and interactions over JSON RPC.
+        # Native multi-turn tools still require a local tool/interaction config.
         if config.actor_rollout_ref.rollout.multi_turn.enable:
-            assert (
-                config.actor_rollout_ref.rollout.multi_turn.tool_config_path is not None
-                or config.actor_rollout_ref.rollout.multi_turn.interaction_config_path is not None
-            ), (
-                "tool_config_path or interaction_config_path must be set when enabling multi_turn with tool, "
-                "due to no role-playing support"
+            ttrl = config.get("ttrl", {})
+            bfcl_runtime = config.get("bfcl_supervised", {}).get("enabled", False) or (
+                ttrl.get("enable", False) and ttrl.get("reward_mode", "math") == "bfcl"
             )
+            if bfcl_runtime:
+                from verl.benchmark_runtime.client import RuntimeClient
+
+                # _validate_ttrl_config already enforces the async AgentLoop
+                # contract. Require an explicit runtime; never import BFCL here.
+                RuntimeClient.from_config(config.get("benchmark_runtime"))
+            else:
+                assert (
+                    config.actor_rollout_ref.rollout.multi_turn.tool_config_path is not None
+                    or config.actor_rollout_ref.rollout.multi_turn.interaction_config_path is not None
+                ), (
+                    "tool_config_path or interaction_config_path must be set when enabling multi_turn with tool, "
+                    "due to no role-playing support"
+                )
             assert config.algorithm.adv_estimator in [AdvantageEstimator.GRPO], (
                 "only GRPO is tested for multi-turn with tool"
             )
