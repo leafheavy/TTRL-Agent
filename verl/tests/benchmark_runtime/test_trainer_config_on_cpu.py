@@ -75,6 +75,7 @@ def smoke_config():
             rollout=Config(
                 name="vllm",
                 mode="async",
+                agent=Config(num_workers=8),
                 n=2,
                 temperature=0.6,
                 log_prob_micro_batch_size=None,
@@ -122,6 +123,17 @@ class TestTrainerMultiTurnConfig(unittest.TestCase):
 
     def test_smoke_external_tools_need_no_native_yaml(self):
         self.trainer._validate_config()
+
+    def test_async_agent_worker_count_is_validated_before_model_initialization(self):
+        for count in (0, -1, True, 1.5, "8", None):
+            with self.subTest(count=count):
+                self.config.actor_rollout_ref.rollout.agent.num_workers = count
+                with self.assertRaisesRegex(ValueError, "agent.num_workers must be a positive integer"):
+                    self.trainer._validate_config()
+        for count in (1, 2, 8):
+            with self.subTest(count=count):
+                self.config.actor_rollout_ref.rollout.agent.num_workers = count
+                self.trainer._validate_config()
 
     def test_supervised_external_tools_need_no_native_yaml(self):
         self.config.ttrl.enable = False

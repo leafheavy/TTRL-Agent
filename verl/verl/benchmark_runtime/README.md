@@ -85,6 +85,12 @@ methods without importing Ray or GPU workers. They cover the smoke and supervise
 remote-tool paths, reject invalid runtime/AgentLoop settings and preserve the
 native multi-turn guards while blocking BFCL dependency imports.
 
+The dispatch regression tests run the real AgentLoop manager and async worker
+methods with metadata-only DataProto inputs and a stub model. They cover small
+and uneven batches, task/context ordering, per-prompt sampling and validation,
+without Ray or a GPU. Only workers with a nonempty chunk are dispatched; tasks
+are never padded or repeated to fill the worker pool.
+
 BFCL runs also exercise every training and validation dataset row on CPU before
 initializing reference, actor or vLLM workers. This uses the real dataset path,
 including chat templates and tool schemas, and retains all selected case IDs.

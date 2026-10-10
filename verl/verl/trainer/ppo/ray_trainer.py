@@ -534,6 +534,11 @@ class RayPPOTrainer:
                 "validation gen temperature should be greater than 0 when enabling do_sample"
             )
 
+        if config.actor_rollout_ref.rollout.get("mode", "sync") == "async":
+            num_workers = config.actor_rollout_ref.rollout.get("agent", {}).get("num_workers")
+            if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 1:
+                raise ValueError("actor_rollout_ref.rollout.agent.num_workers must be a positive integer")
+
         # BFCL sessions supply their schemas and interactions over JSON RPC.
         # Native multi-turn tools still require a local tool/interaction config.
         if config.actor_rollout_ref.rollout.multi_turn.enable:

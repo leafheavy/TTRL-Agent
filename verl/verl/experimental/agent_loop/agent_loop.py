@@ -397,7 +397,7 @@ class AgentLoopManager:
             )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
-        """Split input batch and dispatch to agent loop workers.
+        """Dispatch balanced, nonempty chunks while preserving prompt order.
 
         Args:
             prompts (DataProto): Input batch.
@@ -405,11 +405,21 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+        batch_size = len(prompts)
+        if batch_size == 0:
+            raise ValueError("AgentLoopManager requires a nonempty prompt batch")
+        if not self.agent_loop_workers:
+            raise ValueError("AgentLoopManager requires at least one agent loop worker")
+        num_workers = min(batch_size, len(self.agent_loop_workers))
+        # DataProto.chunk requires equal sizes. Agent loops can process unequal
+        # chunks; slicing avoids empty workers and padding with duplicate tasks.
+        chunks = [
+            prompts[i * batch_size // num_workers : (i + 1) * batch_size // num_workers] for i in range(num_workers)
+        ]
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.wake_up()
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
-            [worker.generate_sequences.remote(chunk) for worker, chunk in zip(self.agent_loop_workers, chunkes)]
+            [worker.generate_sequences.remote(chunk) for worker, chunk in zip(self.agent_loop_workers, chunks)]
         )
         output = DataProto.concat(outputs)
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
