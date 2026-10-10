@@ -219,6 +219,13 @@ class TaskRunner:
             train_sampler=train_sampler,
             device_name=config.trainer.device,
         )
+        # Validate actual tokenized rows before loading reference/actor/vLLM.
+        # BFCL checks all rows, preserving the selected case IDs without filtering.
+        from verl.utils.dataset.preflight import run_data_preflight
+
+        if run_data_preflight(config, train_dataset, val_dataset):
+            return
+
         # Initialize the workers of the trainer.
         trainer.init_workers()
         # Start the training process.

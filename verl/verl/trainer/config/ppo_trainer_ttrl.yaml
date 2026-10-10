@@ -12,6 +12,11 @@ benchmark_runtime:
   endpoint: null
   timeout_s: 120
 
+trainer:
+  # Check config and tokenize datasets, then exit without loading LLM weights.
+  # BFCL training also checks its data before model initialization when false.
+  preflight_only: false
+
 # Separate labeled BFCL-Agent GRPO baseline; never combine with TTRL.
 bfcl_supervised:
   enabled: false

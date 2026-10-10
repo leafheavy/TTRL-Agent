@@ -84,3 +84,10 @@ The config regression tests compile and execute the trainer's actual validation
 methods without importing Ray or GPU workers. They cover the smoke and supervised
 remote-tool paths, reject invalid runtime/AgentLoop settings and preserve the
 native multi-turn guards while blocking BFCL dependency imports.
+
+BFCL runs also exercise every training and validation dataset row on CPU before
+initializing reference, actor or vLLM workers. This uses the real dataset path,
+including chat templates and tool schemas, and retains all selected case IDs.
+Pass `trainer.preflight_only=True` to the TTRL entry point to check configuration
+and tokenized data and then exit without loading LLM weights. Prompt, response,
+rollout model length and training token budgets should be configured together.
