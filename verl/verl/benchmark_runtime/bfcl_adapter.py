@@ -22,6 +22,21 @@ canonical_json = _consensus.canonical_json
 consensus_key = _consensus.consensus_key
 validate_consensus_mode = _consensus.validate_consensus_mode
 
+_failure_modes_spec = importlib.util.spec_from_file_location(
+    "_failure_modes", Path(__file__).with_name("failure_modes.py")
+)
+_failure_modes = importlib.util.module_from_spec(_failure_modes_spec)
+_failure_modes_spec.loader.exec_module(_failure_modes)
+FailureDiagnostics = _failure_modes.FailureDiagnostics
+validate_calls = _failure_modes.validate_calls
+
+_diagnostics_spec = importlib.util.spec_from_file_location(
+    "_bfcl_diagnostics", Path(__file__).with_name("bfcl_diagnostics.py")
+)
+_diagnostics = importlib.util.module_from_spec(_diagnostics_spec)
+_diagnostics_spec.loader.exec_module(_diagnostics)
+BFCLFailureRules = _diagnostics.BFCLFailureRules
+
 
 @lru_cache(maxsize=1)
 def get_bfcl_decoder():
@@ -61,40 +76,53 @@ def _function_validators(functions):
     return validators
 
 
-def decode_bfcl_calls(response, validators, decoder):
-    """Parse and validate calls; category construction lives in ttrl_consensus."""
+def _format_failure(response, rule):
+    """Keep an operation identity only when its JSON payload is already intact."""
+    payload = response.strip()
+    if payload.startswith("<tool_call>"):
+        payload = payload[len("<tool_call>") :].strip()
+    if payload.endswith("</tool_call>"):
+        payload = payload[: -len("</tool_call>")].strip()
+    call = None
+    try:
+        candidate = json.loads(payload)
+        canonical_json(candidate)
+        if (
+            isinstance(candidate, dict)
+            and isinstance(candidate.get("name"), str)
+            and isinstance(candidate.get("arguments"), dict)
+        ):
+            call = {"name": candidate["name"], "arguments": candidate["arguments"]}
+    except (ValueError, TypeError):
+        pass
+    return {"kind": "format_failure", "rule": rule, "evidence": rule, "call": call}
+
+
+def _inspect_bfcl_calls(response, validators, decoder, collect_failures=True):
+    """Reuse BFCL parsing and JSON Schema; return evidence alongside rejected calls."""
     response = response.strip()
     if response == "[]":
-        return []  # Explicit no-call result; never infer this from a parser failure.
+        return [], []  # Explicit no-call result; never infer this from a parser failure.
     matches = list(re.finditer(r"<tool_call>(.*?)</tool_call>", response, re.DOTALL))
     if not matches or response.count("<tool_call>") != len(matches) or response.count("</tool_call>") != len(matches):
-        return None
+        return None, ([_format_failure(response, "invalid_tool_call_framing")] if collect_failures else [])
     # BFCL versions differ in whitespace tolerance. Normalize framing only,
     # leaving JSON parsing to the original extractor.
     framed = "\n".join(f"<tool_call>\n{match.group(1).strip()}\n</tool_call>" for match in matches)
     try:
         calls = decoder(framed)
     except (ValueError, TypeError, KeyError):
-        return None
+        return None, ([_format_failure(response, "unparseable_tool_call")] if collect_failures else [])
     # BFCL can silently discard malformed JSON. Reject the whole response if
     # any of its calls disappeared instead of voting on a successful prefix.
     if not isinstance(calls, list) or len(calls) != len(matches):
-        return None
-    normalized = []
-    for call in calls:
-        if not isinstance(call, dict):
-            return None
-        name, arguments = call.get("name"), call.get("arguments")
-        if not isinstance(name, str) or name not in validators or not isinstance(arguments, dict):
-            return None
-        if not validators[name].is_valid(arguments):
-            return None
-        normalized.append({"name": name, "arguments": arguments})
-    try:
-        canonical_json(normalized)  # Reject non-JSON values, including NaN.
-        return normalized
-    except (TypeError, ValueError):
-        return None
+        return None, ([_format_failure(response, "unparseable_tool_call")] if collect_failures else [])
+    return validate_calls(calls, validators, collect_failures=collect_failures)
+
+
+def decode_bfcl_calls(response, validators, decoder):
+    """Compatibility entry point for single-turn voting and existing callers."""
+    return _inspect_bfcl_calls(response, validators, decoder, collect_failures=False)[0]
 
 
 @lru_cache(maxsize=1)
@@ -208,6 +236,10 @@ class BFCLSession:
         self.execution_trace = [[]] if context.get("record_execution_trace", False) else None
         self.explicit_no_call, self.episode_completed = False, False
         self.num_calls, self.parse_errors, self.execution_errors = 0, 0, 0
+        self.diagnostics = FailureDiagnostics(
+            BFCLFailureRules(self.classes, self.name_map),
+            enabled=context.get("failure_mode_detection", {}).get("enabled", False),
+        )
         self.blocked = False
         try:
             _, self.instances = self._execute([])
@@ -230,14 +262,17 @@ class BFCLSession:
         )
 
     def parse_calls(self, response):
-        calls = decode_bfcl_calls(response, self.validators, self.decoder)
-        if calls is not None:
-            return calls
-        if not response.strip() or "<tool_call>" in response or "</tool_call>" in response:
-            return None
-        if response.lstrip().startswith(("{", "[")):
-            return None  # Malformed structured calls are not natural-language termination.
-        return []  # Clarification/refusal/final text is a normal terminal behavior.
+        # Normal final text/clarification is not a malformed tool call.
+        structured = "<tool_call>" in response or "</tool_call>" in response or response.lstrip().startswith(("{", "["))
+        if response.strip() and not structured:
+            return []
+        calls, failures = _inspect_bfcl_calls(
+            response, self.validators, self.decoder, collect_failures=self.diagnostics.enabled
+        )
+        if response.strip():
+            for failure in failures:
+                self.diagnostics.record(**failure, turn=self.turn_index)
+        return calls  # Rejected structured calls stay distinct from normal final text.
 
     def execute(self, calls):
         """Execute calls in order; API-level errors remain visible observations."""
@@ -263,7 +298,8 @@ class BFCLSession:
             errors = sum(result.startswith("Error during execution:") for result in results)
             self.execution_errors += errors
             self.blocked = bool(errors)
-            for result in results:
+            for call, result in zip(calls, results):
+                self.diagnostics.observe(call, result, turn=self.turn_index)
                 try:
                     observation = json.loads(result)
                 except ValueError:
@@ -324,6 +360,8 @@ class BFCLSession:
             "num_calls": self.num_calls,
             "parse_errors": self.parse_errors,
             "execution_errors": self.execution_errors,
+            "failure_mode_detection_enabled": self.diagnostics.enabled,
+            "failure_modes": self.diagnostics.snapshot(termination, self.episode_completed, turn=self.turn_index),
         }
         if self.execution_trace is not None:
             outcome["execution_trace"] = deepcopy(self.execution_trace)

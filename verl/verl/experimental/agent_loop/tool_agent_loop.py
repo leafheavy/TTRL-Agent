@@ -128,9 +128,13 @@ class ToolAgentLoop(AgentLoopBase):
         session = None
         if bfcl_context is not None:
             from verl.benchmark_runtime.client import open_remote_session
-            from verl.utils.reward_score.ttrl_bfcl import BFCLSession
+            from verl.utils.reward_score.ttrl_bfcl import BFCLSession, decode_bfcl_context
 
-            session = await open_remote_session(bfcl_context, self.config.get("benchmark_runtime"), BFCLSession)
+            session_context = dict(decode_bfcl_context(bfcl_context))
+            session_context["failure_mode_detection"] = {
+                "enabled": self.config.get("failure_mode_detection", {}).get("enabled", False)
+            }
+            session = await open_remote_session(session_context, self.config.get("benchmark_runtime"), BFCLSession)
         try:
             return await self._run(messages, sampling_params, session)
         finally:
@@ -257,13 +261,18 @@ class ToolAgentLoop(AgentLoopBase):
         prompt_ids = prompt_ids[:initial_prompt_length]
 
         outcome = await self.loop.run_in_executor(None, session.outcome, termination) if session else None
+        extra_fields = {"bfcl_outcome": outcome} if session else {}
+        if outcome is not None:
+            for field in ("failure_modes", "failure_mode_detection_enabled"):
+                if field in outcome:
+                    extra_fields[field] = outcome[field]
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
             num_turns=user_turns + assistant_turns + 1,
             metrics=metrics,
-            extra_fields={"bfcl_outcome": outcome} if session else {},
+            extra_fields=extra_fields,
         )
         return output
 

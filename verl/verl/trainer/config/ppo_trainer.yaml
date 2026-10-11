@@ -4,6 +4,12 @@
 # 3. Inline comments (after a field on the same line) are not allowed.
 # 4. Indentation level is respected for nested fields.
 
+# Operational diagnostics are independent of task rewards and benchmarks.
+failure_mode_detection:
+
+  # Opt in to recording errors and conservative recovery states.
+  enabled: false
+
 # dataset config
 data:
 

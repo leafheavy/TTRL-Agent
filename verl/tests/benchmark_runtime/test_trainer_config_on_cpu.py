@@ -124,6 +124,17 @@ class TestTrainerMultiTurnConfig(unittest.TestCase):
     def test_smoke_external_tools_need_no_native_yaml(self):
         self.trainer._validate_config()
 
+    def test_failure_mode_detection_requires_an_explicit_boolean(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                self.config.failure_mode_detection = Config(enabled=enabled)
+                self.trainer._validate_config()
+        for enabled in (1, 0, "true", "false", None):
+            with self.subTest(enabled=enabled):
+                self.config.failure_mode_detection.enabled = enabled
+                with self.assertRaisesRegex(ValueError, "failure_mode_detection.enabled.*bool"):
+                    self.trainer._validate_config()
+
     def test_async_agent_worker_count_is_validated_before_model_initialization(self):
         for count in (0, -1, True, 1.5, "8", None):
             with self.subTest(count=count):

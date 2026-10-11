@@ -1,3 +1,8 @@
+# Operational diagnostics are independent of task rewards and benchmarks.
+failure_mode_detection:
+  # Opt in to recording errors and conservative recovery states.
+  enabled: false
+
 data:
   tokenizer: null
   train_files: ~/data/rlhf/gsm8k/train.parquet

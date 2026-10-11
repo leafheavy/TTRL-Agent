@@ -36,6 +36,65 @@ client = load("runtime_client_test", RUNTIME_DIR / "client.py")
 server = load("runtime_server_test", RUNTIME_DIR / "server.py")
 
 
+class TestOperationalRules(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load("failure_modes_rules_test", RUNTIME_DIR / "failure_modes.py")
+        cls.rules = load("operational_rules_test", RUNTIME_DIR / "bfcl_diagnostics.py")
+
+    def diagnostics(self):
+        return self.core.FailureDiagnostics(self.rules.BFCLFailureRules(["VehicleControlAPI"]), enabled=True)
+
+    def test_vehicle_start_preconditions_and_explicit_recovery(self):
+        call = {"name": "startEngine", "arguments": {"ignitionMode": "START"}}
+        cases = [
+            ("Brake pedal needs to be pressed when starting the engine.", "brake_not_pressed"),
+            ("Must press the brake fully before starting the engine.", "brake_not_fully_pressed"),
+            (
+                "All doors must be locked before starting the engine. Here are the unlocked doors: driver, rear_left",
+                "doors_not_locked",
+            ),
+        ]
+        for error, rule in cases:
+            with self.subTest(rule=rule):
+                diagnostics = self.diagnostics()
+                diagnostics.observe(call, json.dumps({"error": error}))
+                event = diagnostics.snapshot("completed", True)[0]
+                self.assertEqual(event["type"], "precondition_violation")
+                self.assertEqual(event["rule"], rule)
+                diagnostics.observe(call, {"engineState": "running", "fuelLevel": 50, "batteryVoltage": 12.5})
+                events = diagnostics.snapshot("completed", True)
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["recovery"], "recovered")
+
+    def test_vehicle_cruise_requires_a_corresponding_success(self):
+        diagnostics = self.diagnostics()
+        call = {
+            "name": "setCruiseControl",
+            "arguments": {"speed": 60, "activate": True, "distanceToNextVehicle": 50},
+        }
+        diagnostics.observe(call, {"error": "Start the engine before activating the cruise control."})
+        diagnostics.observe(call, {"cruiseStatus": "active", "currentSpeed": 40, "distanceToNextVehicle": 50})
+        event = diagnostics.snapshot("response_length", False)[0]
+        self.assertEqual(event["rule"], "engine_not_started")
+        self.assertEqual(event["recovery"], "unknown")
+        diagnostics.observe(call, {"cruiseStatus": "active", "currentSpeed": 60, "distanceToNextVehicle": 50})
+        self.assertEqual(diagnostics.snapshot("completed", True)[0]["recovery"], "recovered")
+
+    def test_vehicle_ambiguous_exceptions_and_partial_results_are_ignored(self):
+        diagnostics = self.diagnostics()
+        call = {"name": "startEngine", "arguments": {"ignitionMode": "START"}}
+        for observation in (
+            "Error during execution: connection timed out",
+            {"error": "Service unavailable"},
+            {"error": "All doors must be locked before starting the engine. Here are the unlocked doors: unknown"},
+            {"engineState": "running"},
+            None,
+        ):
+            diagnostics.observe(call, observation)
+        self.assertEqual(diagnostics.snapshot("completed", True), [])
+
+
 class CounterSession:
     def __init__(self, context):
         self.tool_schemas = []
@@ -178,10 +237,27 @@ def execute_multi_turn_func_call(calls, initial_config, classes, model, task, **
     if key not in globals(): globals()[key] = FileSystem()
     fs = globals()[key]
     results = []
+
+    def target(path):
+        parts = path.strip("/").split("/")
+        parent = fs.root
+        for part in parts[:-1]: parent = parent[part]
+        return parent, parts[-1]
+
     for call in calls:
         node = ast.parse(call, mode="eval").body
         args = {item.arg: ast.literal_eval(item.value) for item in node.keywords}
-        if node.func.id == "mkdir": fs.root[args["dir_name"]] = {}; result = None
+        if node.func.id == "mkdir":
+            parent, name = target(args["dir_name"])
+            parent[name] = {}; result = None
+        elif node.func.id == "rmdir":
+            path = args["dir_name"]
+            parent, name = target(path)
+            if name not in parent: result = {"error": f"rmdir: cannot remove '{path}': No such file or directory"}
+            elif parent[name]: result = {"error": f"rmdir: cannot remove '{path}': Directory not empty"}
+            else:
+                del parent[name]
+                result = {"result": f"'{path}' removed"}
         elif node.func.id == "cd": fs.cwd = "/" + args["folder"]; result = None
         elif node.func.id == "pwd": result = fs.cwd
         else: raise ValueError("unknown fixture function")
@@ -304,6 +380,189 @@ class TestSeparateEnvironments(unittest.TestCase):
         session = client.RemoteSession(context(**overrides), self.config)
         self.addCleanup(session.close)
         return session
+
+    def diagnostic_session(self, **overrides):
+        before = self.audit.read_text()
+
+        def check_no_oracle_access():
+            after = self.audit.read_text()
+            for operation in ("oracle_read", "checker_call"):
+                self.assertEqual(before.count(operation), after.count(operation))
+
+        self.addCleanup(check_no_oracle_access)
+        functions = context()["functions"] + [
+            {
+                "name": "rmdir",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"dir_name": {"type": "string"}},
+                    "required": ["dir_name"],
+                },
+            },
+            {
+                "name": "cd",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"folder": {"type": "string"}},
+                    "required": ["folder"],
+                },
+            },
+        ]
+        if "failure_mode_detection" not in overrides:
+            overrides["failure_mode_detection"] = {"enabled": True}
+        elif overrides["failure_mode_detection"] is None:
+            overrides.pop("failure_mode_detection")
+        return self.session(functions=functions, **overrides)
+
+    @staticmethod
+    def execute_call(session, name, **arguments):
+        response = "<tool_call>" + json.dumps({"name": name, "arguments": arguments}) + "</tool_call>"
+        return session.execute(session.parse_calls(response))
+
+    def nonempty_directory(self, session):
+        self.execute_call(session, "mkdir", dir_name="A")
+        self.execute_call(session, "mkdir", dir_name="A/B")
+
+    def test_diagnostics_switch_preserves_validation_when_disabled(self):
+        for settings in (None, {"enabled": False}, {"enabled": True}):
+            with self.subTest(settings=settings):
+                session = self.diagnostic_session(failure_mode_detection=settings)
+                for response in (
+                    "<tool_call>{broken}</tool_call>",
+                    '<tool_call>{"name":"mkdir","arguments":{}}</tool_call>',
+                ):
+                    self.assertIsNone(session.parse_calls(response))
+                    session.malformed_response()
+                self.nonempty_directory(session)
+                self.execute_call(session, "rmdir", dir_name="A")
+                session.finish_turn("done")
+                outcome = session.outcome("completed")
+                enabled = settings is not None and settings["enabled"]
+                self.assertIs(outcome["failure_mode_detection_enabled"], enabled)
+                self.assertEqual(outcome["parse_errors"], 2)
+                self.assertEqual(outcome["num_calls"], 3)
+                self.assertEqual(
+                    [event["type"] for event in outcome["failure_modes"]],
+                    ["format_failure", "schema_failure", "precondition_violation"] if enabled else [],
+                )
+
+    def test_diagnostics_distinguish_format_and_schema_without_double_counting(self):
+        cases = [
+            ("<tool_call>{broken}</tool_call>", "format_failure"),
+            ('<tool_call>{"name":"mkdir","arguments":{}}</tool_call>', "schema_failure"),
+            ('<tool_call>{"name":"mkdir","arguments":{"dir_name":3}}</tool_call>', "schema_failure"),
+        ]
+        for response, kind in cases:
+            with self.subTest(kind=kind, response=response):
+                session = self.diagnostic_session()
+                self.assertIsNone(session.parse_calls(response))
+                session.malformed_response()
+                self.execute_call(session, "pwd")
+                session.finish_turn("done")
+                outcome = session.outcome("completed")
+                self.assertEqual(outcome["parse_errors"], 1)
+                self.assertEqual([event["type"] for event in outcome["failure_modes"]], [kind])
+                self.assertEqual(outcome["failure_modes"][0]["recovery"], "unknown")
+
+    def test_diagnostics_accept_natural_language_and_explicit_no_call(self):
+        for response in ("Please clarify the destination.", "done", "[]"):
+            with self.subTest(response=response):
+                session = self.diagnostic_session()
+                self.assertEqual(session.parse_calls(response), [])
+                session.finish_turn(response)
+                self.assertEqual(session.outcome("completed")["failure_modes"], [])
+
+    def test_diagnostics_reject_the_entire_response_with_a_malformed_call(self):
+        session = self.diagnostic_session()
+        response = (
+            '<tool_call>{"name":"mkdir","arguments":{"dir_name":"A"}}</tool_call>' "<tool_call>{broken}</tool_call>"
+        )
+        self.assertIsNone(session.parse_calls(response))
+        session.malformed_response()
+        session.finish_turn("done")
+        outcome = session.outcome("completed")
+        self.assertEqual(outcome["num_calls"], 0)
+        self.assertEqual([event["type"] for event in outcome["failure_modes"]], ["format_failure"])
+
+    def test_diagnostics_recover_only_the_corresponding_operation(self):
+        session = self.diagnostic_session()
+        self.nonempty_directory(session)
+        self.execute_call(session, "rmdir", dir_name="A")
+        self.execute_call(session, "pwd")
+        self.assertEqual(session.outcome("response_length")["failure_modes"][0]["recovery"], "unknown")
+        self.execute_call(session, "rmdir", dir_name="A/B")
+        self.assertEqual(session.outcome("response_length")["failure_modes"][0]["recovery"], "unknown")
+        self.execute_call(session, "rmdir", dir_name="A")
+        session.finish_turn("done")
+        events = session.outcome("completed")["failure_modes"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "precondition_violation")
+        self.assertEqual(events[0]["rule"], "directory_not_empty")
+        self.assertEqual(events[0]["recovery"], "recovered")
+        self.assertEqual(events[0]["recovered_by"]["call"], {"name": "rmdir", "arguments": {"dir_name": "A"}})
+
+    def test_diagnostics_completed_and_truncated_trajectories_have_distinct_status(self):
+        session = self.diagnostic_session()
+        self.nonempty_directory(session)
+        self.execute_call(session, "rmdir", dir_name="A")
+        self.execute_call(session, "pwd")
+        session.finish_turn("done")
+        self.assertEqual(session.outcome("completed")["failure_modes"][0]["recovery"], "unrecovered")
+        self.assertEqual(session.outcome("response_length")["failure_modes"][0]["recovery"], "unknown")
+
+    def test_diagnostics_keep_unknown_after_potential_state_changes(self):
+        for error_kind in ("precondition_violation", "format_failure"):
+            with self.subTest(error_kind=error_kind):
+                session = self.diagnostic_session()
+                self.nonempty_directory(session)
+                if error_kind == "precondition_violation":
+                    self.execute_call(session, "rmdir", dir_name="A")
+                else:
+                    self.assertIsNone(session.parse_calls('{"name":"rmdir","arguments":{"dir_name":"A"}}'))
+                    session.malformed_response()
+                self.execute_call(session, "mkdir", dir_name="C")
+                session.finish_turn("done")
+                event = session.outcome("completed")["failure_modes"][0]
+                self.assertEqual(event["type"], error_kind)
+                self.assertEqual(event["recovery"], "unknown")
+
+    def test_diagnostics_can_recover_identifiable_framing_errors(self):
+        session = self.diagnostic_session()
+        self.execute_call(session, "mkdir", dir_name="A")
+        self.assertIsNone(session.parse_calls('{"name":"rmdir","arguments":{"dir_name":"A"}}'))
+        session.malformed_response()
+        self.execute_call(session, "rmdir", dir_name="A")
+        session.finish_turn("done")
+        event = session.outcome("completed")["failure_modes"][0]
+        self.assertEqual(event["type"], "format_failure")
+        self.assertEqual(event["recovery"], "recovered")
+
+    def test_diagnostics_do_not_link_retries_across_user_turns(self):
+        for retry in (False, True):
+            with self.subTest(retry=retry):
+                session = self.diagnostic_session(future_user_turns=[[{"role": "user", "content": "Next task"}]])
+                self.nonempty_directory(session)
+                self.execute_call(session, "rmdir", dir_name="A")
+                session.finish_turn("Need another step")
+                if retry:
+                    self.execute_call(session, "rmdir", dir_name="A/B")
+                    self.execute_call(session, "rmdir", dir_name="A")
+                session.finish_turn("done")
+                event = session.outcome("completed")["failure_modes"][0]
+                self.assertEqual(event["turn"], 0)
+                self.assertEqual(event["recovery"], "unknown")
+
+    def test_diagnostics_abstain_after_navigation_and_on_unrecognized_errors(self):
+        session = self.diagnostic_session()
+        self.execute_call(session, "rmdir", dir_name="missing")
+        self.assertEqual(session.outcome("response_length")["failure_modes"], [])
+        self.nonempty_directory(session)
+        self.execute_call(session, "rmdir", dir_name="A")
+        self.execute_call(session, "cd", folder=".")
+        self.execute_call(session, "rmdir", dir_name="A/B")
+        self.execute_call(session, "rmdir", dir_name="A")
+        session.finish_turn("done")
+        self.assertEqual(session.outcome("completed")["failure_modes"][0]["recovery"], "unknown")
 
     def test_model_environment_has_no_bfcl_but_can_use_the_adapter(self):
         probe = """import importlib.util, json, sys
@@ -539,7 +798,17 @@ assert "bfcl_eval" not in sys.modules and "jsonschema" not in sys.modules
 
         async def exercise(loop_class):
             baseline = self.rpc.health()["active_sessions"]
-            for behavior in ("complete", "fail", "cancel"):
+            for enabled, behavior in (
+                (None, "complete"),
+                (False, "complete"),
+                (True, "complete"),
+                (False, "fail"),
+                (False, "cancel"),
+            ):
+                if enabled is None:
+                    config.pop("failure_mode_detection", None)
+                else:
+                    config["failure_mode_detection"] = {"enabled": enabled}
                 reached_second_turn = asyncio.Event()
 
                 class Model:
@@ -549,7 +818,9 @@ assert "bfcl_eval" not in sys.modules and "jsonschema" not in sys.modules
 
                     async def generate(self, **kwargs):
                         self.count += 1
-                        if self.count == 1:
+                        if self.count == 1 and self.behavior == "complete":
+                            response = '<tool_call>{"name":"mkdir","arguments":{}}</tool_call><END>'
+                        elif self.count == 1 or (self.count == 2 and self.behavior == "complete"):
                             response = '<tool_call>{"name":"pwd","arguments":{}}</tool_call><END>'
                         elif self.behavior == "fail":
                             raise RuntimeError("generation fixture failure")
@@ -562,7 +833,9 @@ assert "bfcl_eval" not in sys.modules and "jsonschema" not in sys.modules
 
                 loop_class._class_initialized = False
                 loop = loop_class(config, Model(behavior, reached_second_turn), Tokenizer())
-                task = asyncio.create_task(loop.run([{"role": "user", "content": "task"}], {}, context()))
+                session_context = context(failure_mode_detection={"enabled": not bool(enabled)})
+                original_context = json.loads(json.dumps(session_context))
+                task = asyncio.create_task(loop.run([{"role": "user", "content": "task"}], {}, session_context))
                 if behavior == "cancel":
                     await asyncio.wait_for(reached_second_turn.wait(), timeout=5)
                     task.cancel()
@@ -573,9 +846,18 @@ assert "bfcl_eval" not in sys.modules and "jsonschema" not in sys.modules
                         await task
                 else:
                     output = await task
-                    self.assertTrue(output.extra_fields["bfcl_outcome"]["valid"])
+                    outcome = output.extra_fields["bfcl_outcome"]
+                    self.assertTrue(outcome["valid"])
+                    self.assertIs(outcome["failure_mode_detection_enabled"], bool(enabled))
+                    self.assertIs(output.extra_fields["failure_mode_detection_enabled"], bool(enabled))
+                    self.assertEqual(output.extra_fields["failure_modes"], outcome["failure_modes"])
+                    self.assertEqual(
+                        [event["type"] for event in output.extra_fields["failure_modes"]],
+                        ["schema_failure"] if enabled else [],
+                    )
                     self.assertIn(0, output.response_mask)
                     self.assertIn(1, output.response_mask)
+                self.assertEqual(session_context, original_context)
                 self.assertEqual(self.rpc.health()["active_sessions"], baseline)
 
         original_import = builtins.__import__

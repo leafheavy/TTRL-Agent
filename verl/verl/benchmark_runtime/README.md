@@ -65,6 +65,58 @@ semantics. Reference files are accessed only by `score_outcomes`, which is used
 by the explicitly enabled supervised baseline. Session execution and the
 unlabeled TTRL reward do not read reference answers.
 
+## Operational failure diagnostics
+
+`failure_mode_detection.enabled` is a benchmark-independent training setting,
+disabled by default. Set `failure_mode_detection.enabled=True` to enable it in
+the current BFCL AgentLoop. The loop copies this setting into each session's
+`context["failure_mode_detection"]`, overriding dataset metadata. No server flag
+is required. Direct runtime clients can supply the same context explicitly.
+Disabling diagnostics skips recording and rule evaluation; the parser, schema
+validation, tool behavior and task rewards retain their original behavior.
+
+`failure_modes.py` contains only standard-library code. `FailureDiagnostics`
+owns event history and conservative recovery tracking. `validate_calls` accepts
+an existing parser's list of calls and a name-to-validator mapping (objects
+providing `is_valid` and `iter_errors`), so adapters reuse their validators
+without importing a benchmark into the core. It rejects the whole response if
+any call is malformed or schema-invalid. With `collect_failures=False`, it only
+validates and skips constructing diagnostic evidence. Response framing and
+benchmark-specific parsing remain in the adapter.
+
+To add rules for another benchmark, implement `FailureRules`:
+
+| Method | Contract |
+| --- | --- |
+| `identity(call)` | Stable key for a known operation and its current scope, or `None` when association is uncertain. Include all relevant arguments. |
+| `preserves_evidence(call)` | `True` only for a confirmed read-only operation that cannot repair or replace the failed target; defaults to `False`. |
+| `observe(call, result)` | Return `(failure, succeeded)`. `failure` is `None` or a dict with `kind`, `rule`, `evidence`; `succeeded` is `True` only for explicit success of the identified operation. Update any scope here before subsequent identity checks. |
+
+Each session creates `FailureDiagnostics(rules, enabled=...)`. Record confirmed
+parser/schema failures with `record(kind, rule, evidence, call=..., turn=...)`, feed actual
+executions to `observe(call, result, turn=...)`, and put
+`snapshot(termination, episode_completed, turn=...)` in its outcome. A failure
+from `validate_calls` already includes `call`; use `record(**failure, turn=...)`
+for those entries. No task oracle, simulator state query or additional tool
+execution is needed. Unknown rules abstain by default.
+
+The core adds user-turn separation to rule-provided operation keys. Explicit
+success of the same key can confirm recovery. Other actions conservatively
+expire evidence for declaring an old error unrecovered. Only a completed
+episode with current, identifiable failure evidence can produce `unrecovered`;
+truncation, changed scope or uncertain association stays `unknown`. Recovery
+does not delete the original error event. BFCL's public return contracts live
+only in `bfcl_diagnostics.py`; its rules are not applied to other benchmarks.
+
+Expose `failure_modes` and `failure_mode_detection_enabled` in AgentLoop
+`extra_fields` to use the generic trainer log path. With
+`trainer.rollout_data_dir=/path/to/rollouts`, each step's JSONL includes these
+fields. An empty list means no recorded failures, and is not a task-success
+signal. The enabled flag distinguishes disabled detection from no findings.
+BFCL also retains the list inside `bfcl_outcome` for existing consumers. Other
+benchmarks must connect their own adapter/AgentLoop to this core; enabling the
+switch alone does not supply benchmark-specific rules or a new reward path.
+
 Run the transport and environment-boundary checks without Ray or a GPU:
 
 ```bash

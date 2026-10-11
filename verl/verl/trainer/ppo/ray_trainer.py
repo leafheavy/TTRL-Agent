@@ -383,6 +383,8 @@ class RayPPOTrainer:
 
     def _validate_config(self):
         config = self.config
+        if not isinstance(config.get("failure_mode_detection", {}).get("enabled", False), bool):
+            raise ValueError("failure_mode_detection.enabled must be a boolean")
         self._validate_ttrl_config()
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
@@ -1515,11 +1517,15 @@ class RayPPOTrainer:
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            rollout_extra_infos = dict(reward_extra_infos_dict)
+                            for field in ("failure_modes", "failure_mode_detection_enabled"):
+                                if field in batch.non_tensor_batch:
+                                    rollout_extra_infos[field] = batch.non_tensor_batch[field].tolist()
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,
                                 scores=scores,
-                                reward_extra_infos_dict=reward_extra_infos_dict,
+                                reward_extra_infos_dict=rollout_extra_infos,
                                 dump_path=rollout_data_dir,
                             )
 
