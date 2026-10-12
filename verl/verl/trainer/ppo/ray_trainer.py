@@ -1137,6 +1137,34 @@ class RayPPOTrainer:
         ):
             raise ValueError("TTRL with async or SGLang multi-turn rollout requires ttrl.share_rollouts=True")
 
+    def _paired_gradient_due(self):
+        from verl.utils.gradient_diagnostics import paired_recording_due
+
+        record = self.config.actor_rollout_ref.get("actor", {}).get("gradient_record", {})
+        if not record.get("enabled", False) or record.get("mode", "full") != "paired":
+            return False
+        return self.global_steps >= self.config.trainer.critic_warmup and paired_recording_due(
+            record, self.global_steps
+        )
+
+    def _prepare_paired_gradient_advantages(self, batch: DataProto):
+        """Score the existing rollout for diagnosis without replacing TTRL rewards."""
+        if not self._paired_gradient_due():
+            return
+        from verl.utils.reward_score.ttrl_bfcl import BFCLSupervisedReward
+
+        record = self.config.actor_rollout_ref.actor.gradient_record
+        rewards = BFCLSupervisedReward(
+            answer_dir=record.get("answer_dir"), runtime_config=self.config.get("benchmark_runtime")
+        )(batch)
+        advantages, _ = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=rewards,
+            response_mask=batch.batch["response_mask"],
+            index=batch.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+        )
+        batch.batch["diagnostic_supervised_advantages"] = advantages
+
     def _generate_training_rollouts(self, batch: DataProto, gen_batch: DataProto):
         """Generate once, then reuse that output for TTRL voting and GRPO."""
         rollout = self.config.actor_rollout_ref.rollout
@@ -1144,6 +1172,7 @@ class RayPPOTrainer:
         ttrl_enabled = ttrl.get("enable", False)
         shared_rollouts = ttrl_enabled and ttrl.get("share_rollouts", False)
         bfcl_supervised = self.config.get("bfcl_supervised", {}).get("enabled", False)
+        paired_gradient = self._paired_gradient_due()
 
         if bfcl_supervised or (ttrl_enabled and ttrl.get("reward_mode", "math") == "bfcl"):
             from verl.utils.reward_score.ttrl_bfcl import decode_bfcl_context
@@ -1167,7 +1196,7 @@ class RayPPOTrainer:
                     )
                 context = {key: context[key] for key in fields if key in context}
                 context["consensus_mode"] = mode
-                if bfcl_supervised:
+                if bfcl_supervised or paired_gradient:
                     context["record_execution_trace"] = True
                 projection = consensus.get("observable_state", {})
                 if mode == "state" and projection:
@@ -1474,6 +1503,7 @@ class RayPPOTrainer:
 
                             weight_metrics = apply_ttrl_q_weights(batch, self.config.ttrl.get("q_weight", {}))
                             metrics.update({f"train/{key}": value for key, value in weight_metrics.items()})
+                        self._prepare_paired_gradient_advantages(batch)
 
                     # update critic
                     if self.use_critic:
@@ -1499,6 +1529,8 @@ class RayPPOTrainer:
                                     "model_path": str(self.config.actor_rollout_ref.model.path),
                                     "norm_adv_by_std": norm_adv_by_std_in_grpo,
                                     "rollout_n": self.config.actor_rollout_ref.rollout.n,
+                                    "consensus_mode": ttrl.get("consensus", {}).get("mode"),
+                                    "q_weight": dict(ttrl.get("q_weight", {})),
                                 }
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])

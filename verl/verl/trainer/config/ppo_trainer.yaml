@@ -181,11 +181,14 @@ actor_rollout_ref:
     # Gradient clipping for actor updates
     grad_clip: 1.0
 
-    # Optional exact policy-gradient recording, before regularizers and gradient clipping.
+    # Optional exact policy-gradient diagnosis, before regularizers and gradient clipping.
     gradient_record:
 
       # The BFCL-Agent experiment commands enable this by default.
       enabled: false
+
+      # full: legacy FP32 gradient files; paired: same-rollout BFCL/TTRL statistics only.
+      mode: full
 
       # Derived from the run directory; only enabled is needed to toggle recording.
       # All ranks share this directory on multi-GPU jobs.
@@ -193,6 +196,10 @@ actor_rollout_ref:
 
       # Record step 1 and every N trainer steps, including each PPO optimizer minibatch.
       interval: 10
+
+      # Paired mode only: official references on the BFCL runtime host; null uses its default.
+      # Labels are used exclusively for diagnosis, never for the TTRL update.
+      answer_dir: null
 
     # PPO clip ratio
     clip_ratio: 0.2

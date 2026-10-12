@@ -377,7 +377,9 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
-    def _backward_micro_batches(self, micro_batches, temperature, metrics, *, policy_only=False):
+    def _backward_micro_batches(
+        self, micro_batches, temperature, metrics, *, policy_only=False, advantages_key="advantages"
+    ):
         """Reuse the training objective and accumulation for an optional policy-only pass."""
         for data in micro_batches:
             micro_batch_metrics = {}
@@ -393,7 +395,7 @@ class DataParallelPPOActor(BasePPOActor):
                 data = data.to(get_device_id())
             response_mask = data["response_mask"]
             old_log_prob = data["old_log_probs"]
-            advantages = data["advantages"]
+            advantages = data[advantages_key]
 
             clip_ratio = self.config.clip_ratio
             clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
@@ -469,44 +471,92 @@ class DataParallelPPOActor(BasePPOActor):
         if "multi_modal_inputs" in getattr(mini_batch, "non_tensor_batch", {}):
             raise ValueError("Policy gradient recording currently supports text/tool trajectories only")
         devices = [get_device_id()] if self.device_name != "cpu" else []
-        # A second, disposable backward avoids FSDP's unsupported autograd.grad
-        # and reentrant backward on an already-resharded forward graph.
-        # Restore RNG so dropout and the actual training update are unchanged.
-        with torch.random.fork_rng(devices=devices, device_type=self.device_name):
-            digest = hashlib.sha256(torch.random.get_rng_state().numpy().tobytes())
-            if devices:
-                digest.update(getattr(torch, self.device_name).get_rng_state(devices[0]).cpu().numpy().tobytes())
+        digest = hashlib.sha256(torch.random.get_rng_state().numpy().tobytes())
+        if devices:
+            digest.update(getattr(torch, self.device_name).get_rng_state(devices[0]).cpu().numpy().tobytes())
+        tensors = mini_batch.batch if isinstance(mini_batch, DataProto) else mini_batch
+        objective = {
+            "norm_adv_by_std": metadata["norm_adv_by_std"],
+            "rollout_n": metadata["rollout_n"],
+            "temperature": temperature,
+            "loss_agg_mode": self.config.loss_agg_mode,
+            "clip_ratio": self.config.clip_ratio,
+            "clip_ratio_low": self.config.clip_ratio_low,
+            "clip_ratio_high": self.config.clip_ratio_high,
+            "clip_ratio_c": self.config.get("clip_ratio_c", 3.0),
+            "mini_batch_size_per_rank": self.config.ppo_mini_batch_size,
+            "micro_batch_size": self.config.ppo_micro_batch_size_per_gpu,
+            "dynamic_bsz": self.config.use_dynamic_bsz,
+        }
+        metadata = {
+            **metadata,
+            "epoch": epoch,
+            "minibatch": batch_idx,
+            "objective": objective,
+            "rng_fingerprint": digest.hexdigest(),
+        }
+        if self.gradient_record_config.get("mode", "full") == "paired":
+            self._record_paired_policy_gradient(micro_batches, tensors, temperature, metadata, devices)
+            return
+        # A disposable backward avoids FSDP's unsupported autograd.grad and
+        # reentrant backward on an already-resharded forward graph.
+        try:
+            with torch.random.fork_rng(devices=devices, device_type=self.device_name):
+                self.actor_optimizer.zero_grad()
+                self._backward_micro_batches(micro_batches, temperature, None, policy_only=True)
+                save_policy_gradient(
+                    self.actor_module,
+                    tensors,
+                    metadata,
+                    self.gradient_record_config["output_dir"],
+                    rank=torch.distributed.get_rank(),
+                    world_size=world_size,
+                )
+        finally:
             self.actor_optimizer.zero_grad()
-            self._backward_micro_batches(micro_batches, temperature, None, policy_only=True)
-            tensors = mini_batch.batch if isinstance(mini_batch, DataProto) else mini_batch
-            objective = {
-                "norm_adv_by_std": metadata["norm_adv_by_std"],
-                "rollout_n": metadata["rollout_n"],
-                "temperature": temperature,
-                "loss_agg_mode": self.config.loss_agg_mode,
-                "clip_ratio": self.config.clip_ratio,
-                "clip_ratio_low": self.config.clip_ratio_low,
-                "clip_ratio_high": self.config.clip_ratio_high,
-                "clip_ratio_c": self.config.get("clip_ratio_c", 3.0),
-                "mini_batch_size_per_rank": self.config.ppo_mini_batch_size,
-                "micro_batch_size": self.config.ppo_micro_batch_size_per_gpu,
-                "dynamic_bsz": self.config.use_dynamic_bsz,
-            }
-            save_policy_gradient(
-                self.actor_module,
-                tensors,
-                {
-                    **metadata,
-                    "epoch": epoch,
-                    "minibatch": batch_idx,
-                    "objective": objective,
-                    "rng_fingerprint": digest.hexdigest(),
-                },
-                self.gradient_record_config["output_dir"],
-                rank=torch.distributed.get_rank(),
-                world_size=world_size,
-            )
-        self.actor_optimizer.zero_grad()
+
+    def _record_paired_policy_gradient(self, micro_batches, tensors, temperature, metadata, devices):
+        """Compare both rewards at identical parameters without storing gradient files."""
+        from verl.utils.gradient_diagnostics import (
+            capture_policy_gradient,
+            paired_gradient_statistics,
+            save_paired_gradient_statistics,
+        )
+
+        supervised = tensors["diagnostic_supervised_advantages"]
+        if supervised.shape != tensors["advantages"].shape:
+            raise ValueError("Paired policy gradients require identically shaped advantages")
+        cache = None
+        try:
+            # Separate RNG forks start both passes at the same dropout state and
+            # leave the subsequent optimizer update's random sequence unchanged.
+            with torch.random.fork_rng(devices=devices, device_type=self.device_name):
+                self.actor_optimizer.zero_grad()
+                self._backward_micro_batches(
+                    micro_batches,
+                    temperature,
+                    None,
+                    policy_only=True,
+                    advantages_key="diagnostic_supervised_advantages",
+                )
+                cache = capture_policy_gradient(self.actor_module)
+            with torch.random.fork_rng(devices=devices, device_type=self.device_name):
+                self.actor_optimizer.zero_grad()
+                self._backward_micro_batches(micro_batches, temperature, None, policy_only=True)
+                statistics = paired_gradient_statistics(self.actor_module, cache)
+                save_paired_gradient_statistics(
+                    statistics,
+                    tensors,
+                    metadata,
+                    self.gradient_record_config["output_dir"],
+                    cache=cache,
+                    rank=torch.distributed.get_rank(),
+                    world_size=torch.distributed.get_world_size(),
+                    device=torch.device(self.device_name, devices[0]) if devices else None,
+                )
+        finally:
+            self.actor_optimizer.zero_grad()
+            cache = None
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -534,6 +584,10 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if record_gradient and self.gradient_record_config.get("mode", "full") == "paired":
+            if "diagnostic_supervised_advantages" not in data.batch:
+                raise ValueError("Paired policy gradients require trainer-provided supervised advantages")
+            select_keys.append("diagnostic_supervised_advantages")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 

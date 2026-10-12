@@ -7,6 +7,7 @@ from production source and exercised with real PyTorch backward/AdamW.
 import ast
 import hashlib
 import importlib.util
+import json
 import math
 import sys
 import tempfile
@@ -96,7 +97,13 @@ def actor_class():
         ROOT / "verl/workers/actor/dp_actor.py",
         {"DataParallelPPOActor"},
         namespace,
-        methods={"update_policy", "_backward_micro_batches", "_record_policy_gradient", "_optimizer_step"},
+        methods={
+            "update_policy",
+            "_backward_micro_batches",
+            "_record_policy_gradient",
+            "_record_paired_policy_gradient",
+            "_optimizer_step",
+        },
     )
     return namespace["DataParallelPPOActor"]
 
@@ -121,7 +128,7 @@ def sample_batch(step=1):
     )
 
 
-def make_actor(enabled, directory, *, regularizers=True):
+def make_actor(enabled, directory, *, regularizers=True, mode=None):
     torch.manual_seed(42)
     module = nn.Sequential(nn.Linear(3, 5), nn.Dropout(0.25), nn.Linear(5, 2))
     actor = Actor()
@@ -130,6 +137,8 @@ def make_actor(enabled, directory, *, regularizers=True):
     actor.device_name = "cpu"
     actor.ulysses_sequence_parallel_size = 1
     actor.gradient_record_config = {"enabled": enabled, "output_dir": str(directory), "interval": 1}
+    if mode is not None:
+        actor.gradient_record_config["mode"] = mode
     actor.config = Config(
         ppo_mini_batch_size=4,
         ppo_micro_batch_size_per_gpu=2,
@@ -155,6 +164,25 @@ def make_actor(enabled, directory, *, regularizers=True):
 
     actor._forward_micro_batch = forward
     return actor
+
+
+def paired_batch(step=1):
+    batch = sample_batch(step)
+    batch.batch["diagnostic_supervised_advantages"] = torch.tensor(
+        [[1.0, 0.0], [-1.0, -1.0], [-1.0, 0.0], [1.0, 1.0]]
+    )
+    return batch
+
+
+def manual_policy_gradient(batch, *, supervised=False):
+    actor = make_actor(False, "unused")
+    actor.actor_module.train()
+    actor.gradient_accumulation = 2
+    if supervised:
+        batch = Batch({**batch.batch, "advantages": batch.batch["diagnostic_supervised_advantages"]})
+    torch.manual_seed(101)
+    actor._backward_micro_batches(batch.batch.split(2), 1.0, None, policy_only=True)
+    return torch.cat([parameter.grad.flatten().double() for parameter in actor.actor_module.parameters()])
 
 
 class TestPolicyGradientRecording(unittest.TestCase):
@@ -224,6 +252,100 @@ class TestPolicyGradientRecording(unittest.TestCase):
         actor.gradient_record_config["interval"] = 10
         actor.update_policy(sample_batch(step=2))
         self.assertFalse((self.root / "skipped").exists())
+
+    def test_paired_statistics_match_manual_policy_gradients_with_identical_dropout(self):
+        batch = paired_batch()
+        supervised = manual_policy_gradient(batch, supervised=True)
+        unsupervised = manual_policy_gradient(batch)
+        expected_dot = torch.dot(supervised, unsupervised).item()
+        expected_supervised_sq = torch.dot(supervised, supervised).item()
+        expected_unsupervised_sq = torch.dot(unsupervised, unsupervised).item()
+        actor = make_actor(True, self.root / "paired", mode="paired")
+        torch.manual_seed(101)
+        actor.update_policy(batch)
+        files = list((self.root / "paired").glob("*.json"))
+        self.assertEqual(len(files), 1)
+        result = json.loads(files[0].read_text(encoding="utf-8"))
+        self.assertEqual(result["mode"], "paired")
+        self.assertEqual(result["accumulation_dtype"], "float64")
+        self.assertEqual(result["comparison"], "matched_conditions")
+        self.assertEqual(result["numel"], supervised.numel())
+        self.assertAlmostEqual(result["dot_product"], expected_dot, places=14)
+        self.assertAlmostEqual(result["supervised_squared_norm"], expected_supervised_sq, places=14)
+        self.assertAlmostEqual(result["unsupervised_squared_norm"], expected_unsupervised_sq, places=14)
+        self.assertAlmostEqual(
+            result["cosine"], expected_dot / math.sqrt(expected_supervised_sq * expected_unsupervised_sq)
+        )
+        self.assertGreater(result["unsupervised_norm"], actor.config.grad_clip)
+        self.assertFalse(list((self.root / "paired").rglob("*.bin")))
+
+    def test_paired_recording_preserves_training_update_optimizer_rng_and_metrics(self):
+        ordinary = make_actor(False, self.root / "off")
+        recorded = make_actor(True, self.root / "paired", mode="paired")
+        batch = paired_batch()
+        original_advantages = batch.batch["advantages"].clone()
+        torch.manual_seed(101)
+        ordinary_metrics = ordinary.update_policy(sample_batch())
+        rng_after = torch.random.get_rng_state()
+        torch.manual_seed(101)
+        recorded_metrics = recorded.update_policy(batch)
+        for ordinary_parameter, recorded_parameter in zip(
+            ordinary.actor_module.parameters(), recorded.actor_module.parameters()
+        ):
+            self.assertTrue(torch.equal(ordinary_parameter, recorded_parameter))
+        for ordinary_state, recorded_state in zip(
+            ordinary.actor_optimizer.state.values(), recorded.actor_optimizer.state.values()
+        ):
+            self.assertEqual(ordinary_state.keys(), recorded_state.keys())
+            for key in ordinary_state:
+                self.assertTrue(torch.equal(ordinary_state[key], recorded_state[key]))
+        self.assertTrue(torch.equal(rng_after, torch.random.get_rng_state()))
+        self.assertTrue(torch.equal(original_advantages, batch.batch["advantages"]))
+        self.assertEqual(ordinary_metrics, recorded_metrics)
+
+    def test_paired_disabled_or_interval_skip_needs_no_supervised_advantages(self):
+        for enabled, step in ((False, 1), (True, 2)):
+            with self.subTest(enabled=enabled, step=step):
+                actor = make_actor(enabled, self.root / f"skip_{enabled}", mode="paired")
+                actor.gradient_record_config["interval"] = 10
+                with patch.object(actor, "_backward_micro_batches", wraps=actor._backward_micro_batches) as backward:
+                    actor.update_policy(sample_batch(step))
+                self.assertEqual(backward.call_count, 1)
+                self.assertFalse(Path(actor.gradient_record_config["output_dir"]).exists())
+
+    def test_paired_positive_q_weight_changes_norm_not_direction(self):
+        batch = paired_batch()
+        batch.batch["diagnostic_supervised_advantages"] = batch.batch["advantages"].clone()
+        batch.batch["advantages"] *= 0.3
+        actor = make_actor(True, self.root / "paired_weighted", mode="paired", regularizers=False)
+        torch.manual_seed(101)
+        actor.update_policy(batch)
+        result = json.loads(next((self.root / "paired_weighted").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertAlmostEqual(result["cosine"], 1, places=6)
+        self.assertAlmostEqual(result["unsupervised_norm"] / result["supervised_norm"], 0.3, places=6)
+
+    def test_selected_paired_step_requires_supervised_advantages_before_backward(self):
+        actor = make_actor(True, self.root / "missing", mode="paired")
+        with patch.object(actor, "_backward_micro_batches", wraps=actor._backward_micro_batches) as backward:
+            with self.assertRaisesRegex(ValueError, "supervised advantages"):
+                actor.update_policy(sample_batch())
+        backward.assert_not_called()
+        self.assertFalse((self.root / "missing").exists())
+
+    def test_paired_failure_restores_rng_and_clears_disposable_gradients(self):
+        actor = make_actor(True, self.root / "failed", mode="paired")
+        parameters = [parameter.detach().clone() for parameter in actor.actor_module.parameters()]
+        torch.manual_seed(101)
+        rng_before = torch.random.get_rng_state()
+        with patch.object(diagnostics, "paired_gradient_statistics", side_effect=ValueError("diagnostic failed")):
+            with self.assertRaisesRegex(ValueError, "diagnostic failed"):
+                actor.update_policy(paired_batch())
+        for parameter, original in zip(actor.actor_module.parameters(), parameters):
+            self.assertTrue(torch.equal(parameter, original))
+            self.assertIsNone(parameter.grad)
+        self.assertFalse(actor.actor_optimizer.state)
+        self.assertTrue(torch.equal(rng_before, torch.random.get_rng_state()))
+        self.assertFalse((self.root / "failed").exists())
 
 
 class TestGradientComparison(unittest.TestCase):

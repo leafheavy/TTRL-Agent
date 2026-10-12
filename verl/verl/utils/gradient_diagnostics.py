@@ -1,4 +1,4 @@
-"""Record exact policy-loss gradients and compare two training runs offline.
+"""Compare exact policy-loss gradients, either paired in memory or across runs.
 
 Run from the existing verl environment::
 
@@ -9,6 +9,10 @@ Run from the existing verl environment::
 Each optimizer minibatch is a snapshot. Rank shards are stored as float32 binary
 arrays with JSON metadata; comparisons stream the arrays rather than gathering
 the full model or averaging per-rank cosine similarities.
+
+Paired mode instead holds one gradient in CPU memory, compares the second one
+in float64 chunks, and writes only global statistics and matching metadata.
+Export its records with ``--paired /path/to/gradients --output /path/to/diagnosis``.
 """
 
 import argparse
@@ -31,6 +35,10 @@ def recording_due(config, step):
     return bool(config.get("enabled", False)) and (step == 1 or step % config.get("interval", 10) == 0)
 
 
+def paired_recording_due(config, step):
+    return config.get("mode", "full") == "paired" and recording_due(config, step)
+
+
 def validate_gradient_recording(config):
     """Fail early instead of silently recording a regularized or unsupported loss."""
     actor = config.actor_rollout_ref.actor
@@ -42,6 +50,24 @@ def validate_gradient_recording(config):
         raise ValueError("actor.gradient_record.interval must be a positive integer")
     if not record.get("output_dir"):
         raise ValueError("actor.gradient_record.output_dir is required when enabled")
+    mode = record.get("mode", "full")
+    if mode not in ("full", "paired"):
+        raise ValueError("actor.gradient_record.mode must be full or paired")
+    if mode == "paired":
+        ttrl = config.get("ttrl", {})
+        if not ttrl.get("enable", False) or ttrl.get("reward_mode", "math") != "bfcl":
+            raise ValueError("Paired gradient diagnostics require ttrl.enable=True and ttrl.reward_mode=bfcl")
+        if not ttrl.get("share_rollouts", False):
+            raise ValueError("Paired gradient diagnostics require ttrl.share_rollouts=True")
+        if config.get("bfcl_supervised", {}).get("enabled", False):
+            raise ValueError("Paired gradient diagnostics score supervision separately from the TTRL update")
+        rollout = config.actor_rollout_ref.rollout
+        if not rollout.multi_turn.enable or rollout.get("mode", "sync") != "async":
+            raise ValueError("Paired gradient diagnostics require multi_turn.enable=True and rollout.mode=async")
+        if not config.data.get("return_raw_chat", False):
+            raise ValueError("Paired gradient diagnostics require data.return_raw_chat=True")
+        if isinstance(rollout.n, bool) or not isinstance(rollout.n, int) or rollout.n < 2:
+            raise ValueError("Paired gradient diagnostics require rollout.n >= 2")
     if config.algorithm.adv_estimator != "grpo":
         raise ValueError("Policy gradient recording currently requires algorithm.adv_estimator=grpo")
     if config.algorithm.get("use_kl_in_reward", False):
@@ -84,6 +110,12 @@ def batch_fingerprint(batch):
     return digest.hexdigest()
 
 
+def tensor_fingerprint(tensor):
+    digest = hashlib.sha256()
+    _hash_tensor(digest, tensor)
+    return digest.hexdigest()
+
+
 def _parameter_layout(name, parameter):
     local = _local(parameter)
     item = {"name": name, "shape": list(parameter.shape), "local_shape": list(local.shape), "numel": local.numel()}
@@ -95,6 +127,165 @@ def _parameter_layout(name, parameter):
         item["placements"] = [str(placement) for placement in parameter.placements]
         item["mesh"] = parameter.device_mesh.mesh.tolist()
     return item
+
+
+def _parameter_fingerprint(module):
+    digest = hashlib.sha256()
+    for name, parameter in module.named_parameters():
+        digest.update(json.dumps(_parameter_layout(name, parameter), sort_keys=True).encode())
+        _hash_tensor(digest, parameter)
+    return digest.hexdigest()
+
+
+def _gradient_chunks(parameter, name):
+    gradient = parameter.grad
+    if gradient is None:
+        return
+    gradient = _local(gradient)
+    if gradient.shape != _local(parameter).shape:
+        raise ValueError(f"Gradient shard shape differs from parameter shard: {name}")
+    if gradient.is_sparse or not gradient.is_floating_point():
+        raise ValueError(f"Expected a dense real floating-point policy gradient: {name}")
+    for chunk in _cpu_chunks(gradient):
+        if not torch.isfinite(chunk).all():
+            raise ValueError(f"Non-finite pure policy gradient: {name}")
+        yield chunk
+
+
+def capture_policy_gradient(module):
+    """Copy one reduced gradient to CPU without narrowing its dtype or writing it.
+
+    Missing gradients represent zero coordinates and need no CPU allocation.
+    The parameter fingerprint also checks that the second backward uses exactly
+    the same model parameters, including frozen parameters.
+    """
+    parameters = []
+    for name, parameter in module.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        layout = _parameter_layout(name, parameter)
+        gradient = None
+        if parameter.grad is not None:
+            gradient = torch.empty(layout["numel"], dtype=_local(parameter.grad).dtype, device="cpu")
+            for start, chunk in zip(range(0, layout["numel"], CHUNK_SIZE), _gradient_chunks(parameter, name)):
+                gradient[start : start + chunk.numel()].copy_(chunk)
+        parameters.append({"layout": layout, "gradient": gradient})
+    return {
+        "parameters": parameters,
+        "parameter_fingerprint": _parameter_fingerprint(module),
+        "numel": sum(item["layout"]["numel"] for item in parameters),
+    }
+
+
+def paired_gradient_statistics(module, cache):
+    """Return local [dot, supervised squared norm, unsupervised squared norm].
+
+    ``cache`` is the supervised gradient; the module currently holds the second
+    gradient. All original coordinates participate, with float64 accumulation.
+    """
+    parameters = [(name, parameter) for name, parameter in module.named_parameters() if parameter.requires_grad]
+    if len(parameters) != len(cache["parameters"]):
+        raise ValueError("Paired gradient parameter layouts differ")
+    if _parameter_fingerprint(module) != cache["parameter_fingerprint"]:
+        raise ValueError("Paired gradients require unchanged model parameters")
+    statistics = torch.zeros(3, dtype=torch.float64)
+    for (name, parameter), item in zip(parameters, cache["parameters"]):
+        if _parameter_layout(name, parameter) != item["layout"]:
+            raise ValueError(f"Paired gradient parameter layouts differ: {name}")
+        left = item["gradient"]
+        right_chunks = iter(_gradient_chunks(parameter, name))
+        for start in range(0, item["layout"]["numel"], CHUNK_SIZE):
+            x = left[start : start + CHUNK_SIZE].double() if left is not None else None
+            chunk = next(right_chunks, None)
+            y = chunk.double() if chunk is not None else None
+            if x is not None:
+                statistics[1] += torch.dot(x, x)
+            if y is not None:
+                statistics[2] += torch.dot(y, y)
+            if x is not None and y is not None:
+                statistics[0] += torch.dot(x, y)
+    if not torch.isfinite(statistics).all():
+        raise ValueError("Non-finite paired gradient statistics")
+    return statistics
+
+
+def _comparison_statistics(dot, left_sq, right_sq):
+    if not all(math.isfinite(value) for value in (dot, left_sq, right_sq)) or min(left_sq, right_sq) < 0:
+        raise ValueError("Invalid gradient inner product or squared norms")
+    cosine = angle = None
+    status = "ok"
+    if left_sq == 0 or right_sq == 0:
+        status = "both_zero" if left_sq == right_sq == 0 else "supervised_zero" if left_sq == 0 else "unsupervised_zero"
+    else:
+        cosine = float(np.clip(dot / (math.sqrt(left_sq) * math.sqrt(right_sq)), -1, 1))
+        angle = math.degrees(math.acos(cosine))
+    return {
+        "dot_product": dot,
+        "supervised_squared_norm": left_sq,
+        "unsupervised_squared_norm": right_sq,
+        "cosine": cosine,
+        "angle_deg": angle,
+        "supervised_norm": math.sqrt(left_sq),
+        "unsupervised_norm": math.sqrt(right_sq),
+        "status": status,
+    }
+
+
+def save_paired_gradient_statistics(
+    statistics, batch, metadata, directory, *, cache, rank=0, world_size=1, device=None
+):
+    """Reduce only three float64 scalars and write one small atomic JSON record.
+
+    Every rank must call this function. ``device`` must be the actor's local
+    CUDA device when its process group uses NCCL; CPU/Gloo needs no override.
+    """
+    statistics = statistics.detach().to(device="cpu" if device is None else device, dtype=torch.float64).clone()
+    if statistics.shape != (3,) or not torch.isfinite(statistics).all():
+        raise ValueError("Expected three finite paired gradient statistics")
+    fingerprint = {
+        "rank": rank,
+        "numel": cache["numel"],
+        "parameter_fingerprint": cache["parameter_fingerprint"],
+        "batch_fingerprint": batch_fingerprint(batch),
+        "rng_fingerprint": metadata.get("rng_fingerprint"),
+        "supervised_advantage_fingerprint": tensor_fingerprint(batch["diagnostic_supervised_advantages"]),
+        "unsupervised_advantage_fingerprint": tensor_fingerprint(batch["advantages"]),
+    }
+    fingerprints = [fingerprint]
+    if world_size > 1:
+        torch.distributed.all_reduce(statistics, op=torch.distributed.ReduceOp.SUM)
+        fingerprints = [None] * world_size
+        torch.distributed.all_gather_object(fingerprints, fingerprint)
+    fingerprints.sort(key=lambda item: item["rank"])
+    if [item["rank"] for item in fingerprints] != list(range(world_size)):
+        raise ValueError("Missing or duplicated paired gradient rank metadata")
+    key = f"step_{metadata['step']:06d}_epoch_{metadata['epoch']:03d}_minibatch_{metadata['minibatch']:04d}"
+    result = {
+        **metadata,
+        "version": 2,
+        "mode": "paired",
+        "update": key,
+        "world_size": world_size,
+        "gradient": "policy_loss_gradient_before_regularizers_and_grad_clip",
+        "accumulation_dtype": "float64",
+        "numel": sum(item["numel"] for item in fingerprints),
+        "rank_fingerprints": fingerprints,
+        "comparison": "matched_conditions",
+        **_comparison_statistics(*statistics.cpu().tolist()),
+    }
+    if rank == 0:
+        destination = Path(directory)
+        destination.mkdir(parents=True, exist_ok=True)
+        path = destination / f"{key}.json"
+        if path.exists():
+            raise FileExistsError(f"Paired gradient statistics already exist: {path}; use a separate run directory")
+        temporary = path.with_suffix(f".json.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return result
 
 
 def save_policy_gradient(module, batch, metadata, directory, *, rank=0, world_size=1):
@@ -226,21 +417,12 @@ def compare_snapshot(supervised, unsupervised):
                 dot += float(np.dot(x, y))
                 left_sq += float(np.dot(x, x))
                 right_sq += float(np.dot(y, y))
-    cosine = angle = None
-    status = "ok"
-    if left_sq == 0 or right_sq == 0:
-        status = "both_zero" if left_sq == right_sq == 0 else "supervised_zero" if left_sq == 0 else "unsupervised_zero"
-    else:
-        cosine = float(np.clip(dot / math.sqrt(left_sq * right_sq), -1, 1))
-        angle = math.degrees(math.acos(cosine))
+    statistics = _comparison_statistics(dot, left_sq, right_sq)
     return {
         "update": Path(supervised).name,
-        "cosine": cosine,
-        "angle_deg": angle,
-        "supervised_norm": math.sqrt(left_sq),
-        "unsupervised_norm": math.sqrt(right_sq),
+        **{field: statistics[field] for field in ("cosine", "angle_deg", "supervised_norm", "unsupervised_norm")},
         "comparison": "+".join(sorted(differences)) if differences else "matched_conditions",
-        "status": status,
+        "status": statistics["status"],
     }
 
 
@@ -257,6 +439,40 @@ def compare_runs(supervised, unsupervised, output):
         if unmatched:
             print(f"Unpaired {label} snapshots, skipped: {', '.join(unmatched)}")
     rows = [compare_snapshot(snapshots[0][key], snapshots[1][key]) for key in common]
+    return _export_comparison(rows, output)
+
+
+def compare_paired_run(directory, output):
+    """Export statistics already computed from paired full-coordinate gradients."""
+    rows = []
+    for path in sorted(Path(directory).glob("step_*_epoch_*_minibatch_*.json")):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            record.get("version") != 2
+            or record.get("mode") != "paired"
+            or record.get("gradient") != "policy_loss_gradient_before_regularizers_and_grad_clip"
+        ):
+            raise ValueError(f"Unsupported paired gradient record: {path}")
+        statistics = _comparison_statistics(
+            record["dot_product"], record["supervised_squared_norm"], record["unsupervised_squared_norm"]
+        )
+        rows.append(
+            {
+                "update": record["update"],
+                **{
+                    field: statistics[field]
+                    for field in ("cosine", "angle_deg", "supervised_norm", "unsupervised_norm")
+                },
+                "comparison": record["comparison"],
+                "status": statistics["status"],
+            }
+        )
+    if not rows:
+        raise ValueError(f"No paired gradient statistics in {directory}")
+    return _export_comparison(rows, output)
+
+
+def _export_comparison(rows, output):
     destination = Path(output)
     destination.mkdir(parents=True, exist_ok=True)
     csv_path = destination / "gradient_comparison.csv"
@@ -318,11 +534,20 @@ def _plot(rows, path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--supervised", required=True, help="Supervised run's gradient_record.output_dir")
-    parser.add_argument("--unsupervised", required=True, help="TTRL run's gradient_record.output_dir")
+    parser.add_argument("--paired", help="Paired run's gradient_record.output_dir")
+    parser.add_argument("--supervised", help="Supervised run's gradient_record.output_dir")
+    parser.add_argument("--unsupervised", help="TTRL run's gradient_record.output_dir")
     parser.add_argument("--output", required=True, help="Directory for comparison CSV and PNG")
     arguments = parser.parse_args()
-    print(f"Saved: {compare_runs(arguments.supervised, arguments.unsupervised, arguments.output)}")
+    if arguments.paired:
+        if arguments.supervised or arguments.unsupervised:
+            parser.error("--paired cannot be combined with --supervised or --unsupervised")
+        path = compare_paired_run(arguments.paired, arguments.output)
+    else:
+        if not arguments.supervised or not arguments.unsupervised:
+            parser.error("provide --paired, or both --supervised and --unsupervised")
+        path = compare_runs(arguments.supervised, arguments.unsupervised, arguments.output)
+    print(f"Saved: {path}")
 
 
 if __name__ == "__main__":
