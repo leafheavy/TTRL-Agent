@@ -117,6 +117,76 @@ BFCL also retains the list inside `bfcl_outcome` for existing consumers. Other
 benchmarks must connect their own adapter/AgentLoop to this core; enabling the
 switch alone does not supply benchmark-specific rules or a new reward path.
 
+## Diagnosis-guided advantage weighting
+
+Detection and policy weighting have separate switches. Keeping
+`failure_mode_detection.enabled=True` and
+`failure_mode_detection.advantage_weight.enabled=False` preserves diagnostics
+without changing advantages. The weighting switch defaults to false. To compare
+only TTRL against TTRL + failure, keep detection enabled in both runs, turn off
+`ttrl.q_weight.enabled`, and change only the failure-weighting switch under the
+same case IDs, initialization, rollout budget and evaluation settings.
+
+```yaml
+failure_mode_detection:
+  enabled: true
+  advantage_weight:
+    enabled: true
+    min_weight: 0.5
+    max_weight: 2.0
+    type_weights:
+      format_failure: 2.0
+      schema_failure: 2.0
+      precondition_violation: 1.5
+```
+
+The implementation borrows the positive trajectory-weight structure from
+[SEAL §3.4, equations (10)–(12)](https://arxiv.org/html/2605.24426v1#S3.SS4).
+Its local labels and utilities are adapted defaults, not a reproduction of the
+paper's utility table; the paper's diagnosis and utility taxonomies are not
+one-to-one. SEAL's environment-interface evolution is not implemented here.
+
+For each actual user turn with a generation attempt, choose at most one dominant
+label with priority `format_failure > schema_failure > precondition_violation`.
+A turn with no recorded event has fixed neutral utility 1.0, which does not mean
+task success. Repeated events in the same user turn do not add extra weight.
+All confirmed historical failures contribute, including events whose recovery
+status is `recovered` or `unknown`; recovery status does not select the utility.
+`unknown` concerns recovery, not whether the recorded failure occurred.
+
+For rollout $i$ with $L_i$ actual user turns, compute
+
+$$
+d_i=\operatorname{clip}\left(\frac1{L_i}\sum_{u=1}^{L_i}\rho(z_{iu}),
+w_{\min},w_{\max}\right),\qquad
+\widetilde A_i=w(q)d_iA_i^{\mathrm{GRPO}}.
+$$
+
+Apply this weight after GRPO normalization and do not normalize again. A positive
+weight preserves the advantage sign: it can amplify either reinforcement or a
+penalty, but cannot fix an incorrect consensus signal or create a gradient from
+zero advantages. Raw rewards, returns, independent KL regularization and the
+supervised side of paired gradient diagnostics remain unchanged. No reference
+answers or official scores are used to compute the failure weight.
+
+The current weighting path requires BFCL multi-turn asynchronous TTRL, shared
+rollouts, GRPO, enabled detection and `algorithm.use_kl_in_reward=False`. Disable
+the weighting switch for the independent BFCL supervised baseline. Standalone
+failure-weight training is unsupported because a positive weight does not supply
+a base advantage; constructing a new failure-derived reward would be a separate
+algorithm.
+
+Adapters/AgentLoops additionally expose `failure_mode_num_turns` in `extra_fields`:
+the number of user turns actually processed with generation attempts, not the
+scheduled total. Keep this field and `failure_modes` aligned with their rollout
+rows through sampling and reordering. The trainer stores the per-row tensor
+`ttrl_failure_weight`; rollout JSONL adds `failure_advantage_weight` when weighting
+is enabled. Metrics include `train/failure_weight_mean`,
+`train/failure_weight_min`, `train/failure_weight_max` and
+`train/failure_detected_fraction`. Paired diagnostics record the `failure_weight`
+configuration and compare the weighted unsupervised direction with the unchanged
+supervised reference.
+
 Run the transport and environment-boundary checks without Ray or a GPU:
 
 ```bash

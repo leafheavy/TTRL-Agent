@@ -21,7 +21,13 @@ from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
 from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage, compute_policy_loss
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import compute_reward, load_reward_manager
-from verl.trainer.ppo.ttrl_utils import _majority_vote, apply_ttrl_q_weights, validate_q_weight_config
+from verl.trainer.ppo.ttrl_utils import (
+    _majority_vote,
+    apply_ttrl_failure_weights,
+    apply_ttrl_q_weights,
+    validate_failure_weight_config,
+    validate_q_weight_config,
+)
 from verl.utils.dataset.rl_dataset import bfcl_chat_template_kwargs
 from verl.utils.reward_score import ttrl_bfcl
 from verl.utils.reward_score.ttrl_consensus import consensus_key, vote_consensus
@@ -1100,6 +1106,242 @@ class TestTTRLQWeights(unittest.TestCase):
             batch.non_tensor_batch["majority_ratio_list"][1] = invalid
             with self.subTest(q=invalid), self.assertRaises(ValueError):
                 apply_ttrl_q_weights(batch, {"enabled": True})
+
+
+class TestTTRLFailureWeights(unittest.TestCase):
+    def config(self, **overrides):
+        return {
+            "enabled": True,
+            "min_weight": 0.5,
+            "max_weight": 2.0,
+            "type_weights": {
+                "format_failure": 2.0,
+                "schema_failure": 2.0,
+                "precondition_violation": 1.5,
+            },
+            **overrides,
+        }
+
+    def event(self, kind="format_failure", turn=0, recovery="unknown"):
+        return {"type": kind, "turn": turn, "recovery": recovery}
+
+    def make_batch(self, events=None, turns=None):
+        events = [[], [], [], []] if events is None else events
+        rows = len(events)
+        mask = torch.tensor([[1.0, 0.0, 1.0], [1.0, 1.0, 0.0]] * (rows // 2))
+        scores = torch.zeros_like(mask)
+        scores[::2, -1] = 1.0
+        uids = np.repeat(np.arange(rows // 2), 2)
+        advantages, returns = compute_grpo_outcome_advantage(scores, mask, uids)
+        failures = np.empty(rows, dtype=object)
+        failures[:] = deepcopy(events)
+        return Batch(
+            rows,
+            tensors={
+                "advantages": advantages,
+                "returns": returns,
+                "token_level_scores": scores,
+                "token_level_rewards": scores.clone(),
+                "response_mask": mask,
+                "diagnostic_supervised_advantages": torch.full_like(mask, 0.125),
+            },
+            metadata={
+                "uid": uids,
+                "majority_ratio_list": np.full(rows, 0.5),
+                "failure_modes": failures,
+                "failure_mode_detection_enabled": np.ones(rows, dtype=bool),
+                "failure_mode_num_turns": np.array([1] * rows if turns is None else turns),
+                "bfcl_outcome": np.array([PoisonOracle() for _ in range(rows)], dtype=object),
+                "extra_info": np.array([PoisonOracle() for _ in range(rows)], dtype=object),
+                "reward_model": np.array([PoisonOracle() for _ in range(rows)], dtype=object),
+            },
+        )
+
+    def test_disabled_does_not_read_metadata_or_change_tensors(self):
+        batch = self.make_batch()
+        before = dict(batch.batch)
+        batch.non_tensor_batch = PoisonOracle()
+        self.assertEqual(apply_ttrl_failure_weights(batch, {"enabled": False}), {})
+        self.assertEqual(set(batch.batch), set(before))
+        for key, tensor in before.items():
+            self.assertIs(batch.batch[key], tensor, key)
+
+    def test_neutral_and_turn_profiles_include_all_confirmed_recovery_states(self):
+        events = [
+            [],
+            [
+                self.event("schema_failure", 0, "unknown"),
+                self.event("precondition_violation", 0, "recovered"),
+                self.event("format_failure", 0, "recovered"),
+                self.event("precondition_violation", 1, "unrecovered"),
+            ],
+            [self.event(recovery="recovered"), self.event(recovery="unknown")],
+            [self.event("precondition_violation", 2, "unrecovered")],
+        ]
+        batch = self.make_batch(events, [3, 3, 1, 3])
+        original = batch.batch["advantages"].clone()
+        metrics = apply_ttrl_failure_weights(batch, self.config())
+        expected = torch.tensor([1.0, 1.5, 2.0, 7 / 6])
+        torch.testing.assert_close(batch.batch["ttrl_failure_weight"], expected)
+        torch.testing.assert_close(batch.batch["advantages"], original * expected.unsqueeze(-1))
+        self.assertAlmostEqual(metrics["failure_weight_mean"], expected.mean().item())
+        self.assertEqual(metrics["failure_weight_min"], 1.0)
+        self.assertEqual(metrics["failure_weight_max"], 2.0)
+        self.assertEqual(metrics["failure_detected_fraction"], 0.75)
+
+    def test_priority_is_by_failure_type_not_largest_weight_or_event_count(self):
+        simultaneous = [
+            self.event("precondition_violation"),
+            self.event("schema_failure"),
+            self.event("format_failure"),
+        ]
+        batch = self.make_batch([simultaneous, simultaneous[::-1], [], []], [2, 2, 2, 2])
+        config = self.config(type_weights={
+            "format_failure": 0.75,
+            "schema_failure": 1.5,
+            "precondition_violation": 1.75,
+        })
+        apply_ttrl_failure_weights(batch, config)
+        torch.testing.assert_close(batch.batch["ttrl_failure_weight"], torch.tensor([0.875, 0.875, 1.0, 1.0]))
+
+    def test_turn_average_is_clipped_after_aggregation_including_neutral(self):
+        batch = self.make_batch([[self.event()], [], [self.event()], []], [2, 2, 1, 1])
+        apply_ttrl_failure_weights(batch, self.config(
+            min_weight=1.25, max_weight=2.5, type_weights={"format_failure": 4.0},
+        ))
+        # (4 + 1) / 2 remains 2.5: clipping each turn first would yield 1.75.
+        torch.testing.assert_close(batch.batch["ttrl_failure_weight"], torch.tensor([2.5, 1.25, 2.5, 1.25]))
+
+    def test_only_advantages_change_and_action_mask_is_preserved(self):
+        batch = self.make_batch([[self.event()], [], [], []])
+        original = {key: tensor.clone() for key, tensor in batch.batch.items()}
+        objects = dict(batch.batch)
+        metadata = deepcopy(batch.non_tensor_batch)
+        apply_ttrl_failure_weights(batch, self.config())
+        self.assertEqual(set(batch.batch) - set(original), {"ttrl_failure_weight"})
+        for key in original:
+            if key != "advantages":
+                self.assertIs(batch.batch[key], objects[key], key)
+                torch.testing.assert_close(batch.batch[key], original[key], rtol=0, atol=0)
+        self.assertEqual(batch.non_tensor_batch["failure_modes"].tolist(), metadata["failure_modes"].tolist())
+        self.assertEqual(batch.batch["ttrl_failure_weight"].dtype, original["advantages"].dtype)
+        self.assertEqual(batch.batch["ttrl_failure_weight"].device, original["advantages"].device)
+        self.assertTrue(torch.all(batch.batch["advantages"][original["response_mask"] == 0] == 0))
+
+    def test_q_then_failure_multiplies_normalized_advantages_without_renormalizing(self):
+        batch = self.make_batch([[self.event()], [], [self.event("precondition_violation")], []])
+        original = batch.batch["advantages"].clone()
+        apply_ttrl_q_weights(batch, {"enabled": True, "mode": "linear", "floor": 0.0, "power": 1.0})
+        apply_ttrl_failure_weights(batch, self.config())
+        expected = torch.tensor([2.0, 1.0, 1.5, 1.0])
+        torch.testing.assert_close(batch.batch["advantages"], original * 0.5 * expected.unsqueeze(-1))
+        torch.testing.assert_close(batch.batch["ttrl_q_weight"], torch.full((4,), 0.5))
+
+    def test_weighting_cannot_create_advantages_in_an_all_same_reward_group(self):
+        batch = self.make_batch([[self.event()], [], [], []])
+        batch.batch["advantages"].zero_()
+        apply_ttrl_failure_weights(batch, self.config())
+        self.assertTrue(torch.all(batch.batch["advantages"] == 0))
+
+    def test_weights_cannot_be_applied_twice(self):
+        batch = self.make_batch([[self.event()], [], [], []])
+        apply_ttrl_failure_weights(batch, self.config())
+        weighted = batch.batch["advantages"].clone()
+        with self.assertRaisesRegex(ValueError, "once"):
+            apply_ttrl_failure_weights(batch, self.config())
+        torch.testing.assert_close(batch.batch["advantages"], weighted, rtol=0, atol=0)
+
+    def test_enabled_configuration_rejects_invalid_values(self):
+        invalids = (
+            {"enabled": "true"},
+            {"enabled": 1},
+            {"min_weight": float("nan")},
+            {"max_weight": float("inf")},
+            {"min_weight": 0.0},
+            {"max_weight": True},
+            {"min_weight": -0.5},
+            {"min_weight": 2.0, "max_weight": 0.5},
+            {"type_weights": []},
+            {"type_weights": {"format_failure": True}},
+            {"type_weights": {"schema_failure": 0.0}},
+            {"type_weights": {"format_failure": float("nan")}},
+            {"type_weights": {"unsupported_failure": 2.0}},
+        )
+        for invalid in invalids:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_failure_weight_config(self.config(**invalid))
+
+    def test_missing_or_invalid_failure_metadata_fails_before_mutating_advantages(self):
+        invalids = (
+            ("failure_modes", None),
+            ("failure_modes", np.array([None] * 4, dtype=object)),
+            ("failure_modes", np.empty(0, dtype=object)),
+            ("failure_mode_detection_enabled", np.array([True, True, False, True])),
+            ("failure_mode_detection_enabled", np.array(["true"] * 4)),
+            ("failure_mode_num_turns", np.array([1, 0, 1, 1])),
+            ("failure_mode_num_turns", np.array([True] * 4)),
+            ("failure_mode_num_turns", np.array([1.5] * 4)),
+        )
+        for field, value in invalids:
+            with self.subTest(field=field, value=value):
+                batch = self.make_batch()
+                original = batch.batch["advantages"].clone()
+                if value is None:
+                    del batch.non_tensor_batch[field]
+                else:
+                    batch.non_tensor_batch[field] = value
+                with self.assertRaises(ValueError):
+                    apply_ttrl_failure_weights(batch, self.config())
+                torch.testing.assert_close(batch.batch["advantages"], original, rtol=0, atol=0)
+                self.assertNotIn("ttrl_failure_weight", batch.batch)
+
+    def test_malformed_or_out_of_range_events_are_not_treated_as_neutral(self):
+        invalids = (
+            None,
+            {},
+            self.event("unsupported_failure"),
+            self.event(turn=-1),
+            self.event(turn=1),
+            self.event(turn=True),
+            self.event(turn=0.5),
+            self.event(recovery="maybe"),
+            {"type": "format_failure", "turn": 0},
+        )
+        for event in invalids:
+            with self.subTest(event=event):
+                batch = self.make_batch([[], [], [], [event]])
+                original = batch.batch["advantages"].clone()
+                with self.assertRaises(ValueError):
+                    apply_ttrl_failure_weights(batch, self.config())
+                torch.testing.assert_close(batch.batch["advantages"], original, rtol=0, atol=0)
+                self.assertNotIn("ttrl_failure_weight", batch.batch)
+
+    def test_paired_supervised_reference_does_not_inherit_failure_or_q_weights(self):
+        batch = self.make_batch([[self.event()], [], [self.event("precondition_violation")], []])
+        apply_ttrl_q_weights(batch, {"enabled": True, "mode": "linear", "floor": 0.0, "power": 1.0})
+        apply_ttrl_failure_weights(batch, self.config())
+        weighted = batch.batch["advantages"].clone()
+        rewards = torch.zeros_like(weighted)
+        rewards[1::2, 0] = 1.0
+        expected, _ = compute_grpo_outcome_advantage(
+            rewards, batch.batch["response_mask"], batch.non_tensor_batch["uid"]
+        )
+        trainer = object.__new__(RayPPOTrainer)
+        trainer.config = Config(
+            actor_rollout_ref=Config(actor=Config(gradient_record=Config(
+                enabled=True, mode="paired", interval=10, answer_dir=None,
+            ))),
+            algorithm=Config(norm_adv_by_std_in_grpo=True),
+            trainer=Config(critic_warmup=0),
+            benchmark_runtime=Config(endpoint="http://runtime"),
+        )
+        trainer.global_steps = 1
+        scorer = Mock(return_value=rewards)
+        with patch.object(ttrl_bfcl, "BFCLSupervisedReward", return_value=scorer):
+            trainer._prepare_paired_gradient_advantages(batch)
+        scorer.assert_called_once_with(batch)
+        torch.testing.assert_close(batch.batch["diagnostic_supervised_advantages"], expected, rtol=0, atol=0)
+        torch.testing.assert_close(batch.batch["advantages"], weighted, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

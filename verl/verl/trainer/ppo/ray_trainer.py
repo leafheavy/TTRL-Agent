@@ -1068,6 +1068,27 @@ class RayPPOTrainer:
     def _validate_ttrl_config(self):
         """Check the sampling contract before starting TTRL workers."""
         ttrl = self.config.get("ttrl", {})
+        failure_detection = self.config.get("failure_mode_detection", {})
+        failure_weight = failure_detection.get("advantage_weight", {})
+        if failure_weight.get("enabled", False) is not False:
+            from verl.trainer.ppo.ttrl_utils import validate_failure_weight_config
+
+            validate_failure_weight_config(failure_weight)
+            rollout = self.config.actor_rollout_ref.rollout
+            if not failure_detection.get("enabled", False):
+                raise ValueError("Failure advantage weighting requires failure_mode_detection.enabled=True")
+            if (
+                not ttrl.get("enable", False)
+                or ttrl.get("reward_mode", "math") != "bfcl"
+                or not ttrl.get("share_rollouts", False)
+                or self.config.get("bfcl_supervised", {}).get("enabled", False)
+                or self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO
+                or not rollout.multi_turn.enable
+                or rollout.get("mode", "sync") != "async"
+            ):
+                raise ValueError("Failure advantage weighting requires unsupervised TTRL BFCL shared multi-turn GRPO")
+            if self.config.algorithm.get("use_kl_in_reward", False):
+                raise ValueError("Failure advantage weighting requires use_kl_in_reward=False; use actor.use_kl_loss")
         if self.config.get("bfcl_supervised", {}).get("enabled", False):
             from verl.utils.reward_score.ttrl_bfcl import validate_bfcl_supervised_config
 
@@ -1503,6 +1524,12 @@ class RayPPOTrainer:
 
                             weight_metrics = apply_ttrl_q_weights(batch, self.config.ttrl.get("q_weight", {}))
                             metrics.update({f"train/{key}": value for key, value in weight_metrics.items()})
+                        from verl.trainer.ppo.ttrl_utils import apply_ttrl_failure_weights
+
+                        failure_weight_metrics = apply_ttrl_failure_weights(
+                            batch, self.config.get("failure_mode_detection", {}).get("advantage_weight", {})
+                        )
+                        metrics.update({f"train/{key}": value for key, value in failure_weight_metrics.items()})
                         self._prepare_paired_gradient_advantages(batch)
 
                     # update critic
@@ -1519,6 +1546,9 @@ class RayPPOTrainer:
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             if self.config.actor_rollout_ref.actor.get("gradient_record", {}).get("enabled", False):
                                 ttrl = self.config.get("ttrl", {})
+                                failure_weight = self.config.get("failure_mode_detection", {}).get(
+                                    "advantage_weight", {}
+                                )
                                 batch.meta_info["gradient_record"] = {
                                     "step": self.global_steps,
                                     "reward_source": "bfcl_supervised"
@@ -1531,6 +1561,10 @@ class RayPPOTrainer:
                                     "rollout_n": self.config.actor_rollout_ref.rollout.n,
                                     "consensus_mode": ttrl.get("consensus", {}).get("mode"),
                                     "q_weight": dict(ttrl.get("q_weight", {})),
+                                    "failure_weight": {
+                                        **dict(failure_weight),
+                                        "type_weights": dict(failure_weight.get("type_weights", {})),
+                                    },
                                 }
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
@@ -1550,9 +1584,13 @@ class RayPPOTrainer:
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
                             rollout_extra_infos = dict(reward_extra_infos_dict)
-                            for field in ("failure_modes", "failure_mode_detection_enabled"):
+                            for field in ("failure_modes", "failure_mode_detection_enabled", "failure_mode_num_turns"):
                                 if field in batch.non_tensor_batch:
                                     rollout_extra_infos[field] = batch.non_tensor_batch[field].tolist()
+                            if "ttrl_failure_weight" in batch.batch:
+                                rollout_extra_infos["failure_advantage_weight"] = batch.batch[
+                                    "ttrl_failure_weight"
+                                ].detach().cpu().tolist()
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,

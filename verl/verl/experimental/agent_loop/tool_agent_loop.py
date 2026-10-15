@@ -160,7 +160,10 @@ class ToolAgentLoop(AgentLoopBase):
         termination = "completed"
 
         user_turns, assistant_turns = 0, 0
+        active_user_turn, processed_user_turns = 0, 0
         while True:
+            # A released next user turn may never be sampled if a budget ends.
+            processed_user_turns = active_user_turn + 1
             with simple_timer("generate_sequences", metrics):
                 params = dict(sampling_params)
                 if session:
@@ -202,6 +205,7 @@ class ToolAgentLoop(AgentLoopBase):
                     next_turn = await self.loop.run_in_executor(None, session.finish_turn, response_text)
                     if next_turn is None:
                         break
+                    active_user_turn += 1
                     tool_responses = next_turn
                 elif calls is None:
                     tool_responses = await self.loop.run_in_executor(None, session.malformed_response)
@@ -263,6 +267,8 @@ class ToolAgentLoop(AgentLoopBase):
         outcome = await self.loop.run_in_executor(None, session.outcome, termination) if session else None
         extra_fields = {"bfcl_outcome": outcome} if session else {}
         if outcome is not None:
+            outcome["num_user_turns"] = processed_user_turns
+            extra_fields["failure_mode_num_turns"] = processed_user_turns
             for field in ("failure_modes", "failure_mode_detection_enabled"):
                 if field in outcome:
                     extra_fields[field] = outcome[field]

@@ -4,11 +4,36 @@
 # 3. Inline comments (after a field on the same line) are not allowed.
 # 4. Indentation level is respected for nested fields.
 
-# Operational diagnostics are independent of task rewards and benchmarks.
+# Operational diagnostics use deployment-visible evidence, never task labels.
 failure_mode_detection:
 
   # Opt in to recording errors and conservative recovery states.
   enabled: false
+
+  # Optional SEAL-inspired policy scaling, requiring TTRL BFCL multi-turn GRPO.
+  advantage_weight:
+
+    # False preserves the only-TTRL baseline, even if diagnostics are recorded.
+    enabled: false
+
+    # Strictly positive lower bound; weights preserve advantage signs.
+    min_weight: 0.5
+
+    # Upper bound for the USER-turn average diagnostic utility.
+    max_weight: 2.0
+
+    # Local heuristic utilities, not SEAL's original label mapping.
+    # One dominant type per processed user turn; no detected event has utility 1.
+    type_weights:
+
+      # Highest-priority failure: invalid call serialization/structure.
+      format_failure: 2.0
+
+      # Second priority: unavailable tools or invalid public schema arguments.
+      schema_failure: 2.0
+
+      # Third priority: explicitly confirmed public operation preconditions.
+      precondition_violation: 1.5
 
 # dataset config
 data:

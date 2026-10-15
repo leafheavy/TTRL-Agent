@@ -9,6 +9,8 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -38,7 +40,16 @@ def load_validation():
     validator = next(node for node in tree.body if getattr(node, "name", None) == "validate_bfcl_supervised_config")
     reward_module = ModuleType("verl.utils.reward_score.ttrl_bfcl")
     exec(compile(ast.Module(body=[validator], type_ignores=[]), str(path), "exec"), reward_module.__dict__)
-    return namespace["TrainerValidation"], reward_module
+    path = ROOT / "verl/trainer/ppo/ttrl_utils.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    weight_validators = [
+        node for node in tree.body
+        if getattr(node, "name", None) in ("validate_failure_weight_config", "validate_q_weight_config")
+    ]
+    weight_module = ModuleType("verl.trainer.ppo.ttrl_utils")
+    weight_module.np = np
+    exec(compile(ast.Module(body=weight_validators, type_ignores=[]), str(path), "exec"), weight_module.__dict__)
+    return namespace["TrainerValidation"], reward_module, weight_module
 
 
 class Config(dict):
@@ -92,7 +103,7 @@ def smoke_config():
 
 class TestTrainerMultiTurnConfig(unittest.TestCase):
     def setUp(self):
-        trainer_type, reward_module = load_validation()
+        trainer_type, reward_module, weight_module = load_validation()
         modules = {
             name: ModuleType(name)
             for name in ("verl", "verl.benchmark_runtime", "verl.utils", "verl.utils.reward_score")
@@ -102,6 +113,7 @@ class TestTrainerMultiTurnConfig(unittest.TestCase):
             "config_test_consensus", "verl/utils/reward_score/ttrl_consensus.py"
         )
         modules["verl.utils.reward_score.ttrl_bfcl"] = reward_module
+        modules["verl.trainer.ppo.ttrl_utils"] = weight_module
         module_patch = patch.dict(sys.modules, modules)
         module_patch.start()
         self.addCleanup(module_patch.stop)
@@ -134,6 +146,52 @@ class TestTrainerMultiTurnConfig(unittest.TestCase):
                 self.config.failure_mode_detection.enabled = enabled
                 with self.assertRaisesRegex(ValueError, "failure_mode_detection.enabled.*bool"):
                     self.trainer._validate_config()
+
+    def test_failure_advantage_weighting_is_validated_before_model_workers(self):
+        self.config.failure_mode_detection = Config(
+            enabled=True, advantage_weight=Config(enabled=True),
+        )
+        self.trainer._validate_config()
+        self.config.failure_mode_detection.advantage_weight.min_weight = 0
+        with self.assertRaisesRegex(ValueError, "min_weight.*positive"):
+            self.trainer._validate_config()
+        self.config.failure_mode_detection.advantage_weight.min_weight = 0.5
+        self.config.failure_mode_detection.advantage_weight.enabled = "true"
+        with self.assertRaisesRegex(ValueError, "advantage_weight.enabled.*boolean"):
+            self.trainer._validate_config()
+
+    def test_enabled_failure_weights_require_label_free_shared_bfcl_agent_grpo(self):
+        invalids = (
+            (("failure_mode_detection", "enabled"), False),
+            (("ttrl", "enable"), False),
+            (("ttrl", "reward_mode"), "math"),
+            (("ttrl", "share_rollouts"), False),
+            (("bfcl_supervised", "enabled"), True),
+            (("algorithm", "adv_estimator"), "gae"),
+            (("algorithm", "use_kl_in_reward"), True),
+            (("actor_rollout_ref", "rollout", "multi_turn", "enable"), False),
+            (("actor_rollout_ref", "rollout", "mode"), "sync"),
+        )
+        for path, value in invalids:
+            with self.subTest(path=path, value=value):
+                config = smoke_config()
+                config.failure_mode_detection = Config(enabled=True, advantage_weight=Config(enabled=True))
+                target = config
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                self.trainer.config = config
+                with self.assertRaisesRegex(ValueError, "Failure advantage weighting requires"):
+                    self.trainer._validate_config()
+
+    def test_disabled_failure_weights_preserve_the_native_agent_setting(self):
+        self.config.failure_mode_detection = Config(
+            enabled=False, advantage_weight=Config(enabled=False, min_weight="unused"),
+        )
+        self.config.ttrl.enable = False
+        self.config.benchmark_runtime.endpoint = None
+        self.config.actor_rollout_ref.rollout.multi_turn.tool_config_path = "native_tools.yaml"
+        self.trainer._validate_config()
 
     def test_async_agent_worker_count_is_validated_before_model_initialization(self):
         for count in (0, -1, True, 1.5, "8", None):

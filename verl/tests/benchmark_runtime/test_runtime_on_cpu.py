@@ -860,6 +860,41 @@ assert "bfcl_eval" not in sys.modules and "jsonschema" not in sys.modules
                 self.assertEqual(session_context, original_context)
                 self.assertEqual(self.rpc.health()["active_sessions"], baseline)
 
+            # Releasing the next user turn does not mean the policy sampled it.
+            # With the cap reached after finish_turn, only the first turn belongs
+            # in the diagnostic utility average, and its event index stays valid.
+            config["failure_mode_detection"] = {"enabled": True}
+            config.actor_rollout_ref.rollout.multi_turn["max_assistant_turns"] = 2
+
+            class ReleaseThenStopModel:
+                def __init__(self):
+                    self.count = 0
+
+                async def generate(self, **kwargs):
+                    self.count += 1
+                    if self.count == 1:
+                        response = '<tool_call>{"name":"mkdir","arguments":{}}</tool_call><END>'
+                    else:
+                        response = "done<END>"
+                    return list(map(ord, response))
+
+            loop_class._class_initialized = False
+            model = ReleaseThenStopModel()
+            tokenizer = Tokenizer()
+            loop = loop_class(config, model, tokenizer)
+            session_context = context(
+                future_user_turns=[[{"role": "user", "content": "UNSAMPLED_NEXT_USER_TURN"}]]
+            )
+            output = await loop.run([{"role": "user", "content": "task"}], {}, session_context)
+            outcome = output.extra_fields["bfcl_outcome"]
+            self.assertEqual(model.count, 2)
+            self.assertEqual(outcome["termination"], "max_assistant_turns")
+            self.assertEqual(outcome["num_user_turns"], 1)
+            self.assertEqual(output.extra_fields["failure_mode_num_turns"], 1)
+            self.assertEqual([event["turn"] for event in outcome["failure_modes"]], [0])
+            self.assertNotIn("UNSAMPLED_NEXT_USER_TURN", tokenizer.decode(output.response_ids))
+            self.assertEqual(self.rpc.health()["active_sessions"], baseline)
+
         original_import = builtins.__import__
 
         def restricted_import(name, *args, **kwargs):

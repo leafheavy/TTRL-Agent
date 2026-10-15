@@ -121,6 +121,94 @@ def validate_q_weight_config(config):
             raise ValueError(f"Invalid ttrl.q_weight.{key}: {value}")
 
 
+def validate_failure_weight_config(config):
+    """SEAL-style positive utilities over our deployment-observable failure types."""
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("failure_mode_detection.advantage_weight.enabled must be a boolean")
+    if not enabled:
+        return
+    for key, default in (("min_weight", 0.5), ("max_weight", 2.0)):
+        value = config.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value <= 0:
+            raise ValueError(f"failure_mode_detection.advantage_weight.{key} must be finite and positive")
+    if config.get("min_weight", 0.5) > config.get("max_weight", 2.0):
+        raise ValueError("failure advantage min_weight must not exceed max_weight")
+    utilities = config.get("type_weights", {})
+    if not hasattr(utilities, "items"):
+        raise ValueError("failure advantage type_weights must map failure types to positive utilities")
+    defaults = {"format_failure": 2.0, "schema_failure": 2.0, "precondition_violation": 1.5}
+    if set(utilities) - set(defaults):
+        raise ValueError("failure advantage type_weights contains an unsupported failure type")
+    for kind, default in defaults.items():
+        value = utilities.get(kind, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value <= 0:
+            raise ValueError(f"failure advantage type_weights.{kind} must be finite and positive")
+
+
+def apply_ttrl_failure_weights(batch, config):
+    """Scale normalized policy advantages; never infer task failure or use labels.
+
+    Adapt SEAL's turn-profile utility average to the detector's USER-turn indices.
+    Each processed turn contributes its highest-priority confirmed failure type,
+    or neutral utility 1. Repeated errors do not add votes. Recovery describes
+    subsequent evidence and does not erase the historical diagnosis.
+    """
+    import torch
+
+    validate_failure_weight_config(config)
+    if not config.get("enabled", False):
+        return {}
+    if "ttrl_failure_weight" in batch.batch:
+        raise ValueError("Failure advantage weights must be applied exactly once per training batch")
+    fields = ("failure_modes", "failure_mode_detection_enabled", "failure_mode_num_turns")
+    if any(
+        field not in batch.non_tensor_batch or len(batch.non_tensor_batch[field]) != len(batch) for field in fields
+    ):
+        raise ValueError("Failure advantage weighting requires aligned diagnostics and processed user-turn counts")
+    priorities = {"format_failure": 0, "schema_failure": 1, "precondition_violation": 2}
+    utilities = {"format_failure": 2.0, "schema_failure": 2.0, "precondition_violation": 1.5}
+    utilities.update(config.get("type_weights", {}))
+    weights, detected = [], []
+    for events, enabled, turns in zip(*(batch.non_tensor_batch[field] for field in fields)):
+        if not isinstance(enabled, (bool, np.bool_)) or not enabled:
+            raise ValueError(
+                "Failure advantage weighting requires failure_mode_detection.enabled=True on every rollout"
+            )
+        if isinstance(turns, (bool, np.bool_)) or not isinstance(turns, (int, np.integer)) or turns < 1:
+            raise ValueError("failure_mode_num_turns must be a positive processed user-turn count")
+        if not isinstance(events, list):
+            raise ValueError("failure_modes must contain one event list per rollout")
+        dominant = {}
+        for event in events:
+            if not isinstance(event, dict) or event.get("type") not in priorities:
+                raise ValueError("Unsupported or missing failure event type")
+            turn = event.get("turn")
+            if isinstance(turn, (bool, np.bool_)) or not isinstance(turn, (int, np.integer)) or not 0 <= turn < turns:
+                raise ValueError("Failure event turn must index a processed user turn")
+            if event.get("recovery") not in ("recovered", "unrecovered", "unknown"):
+                raise ValueError("Failure event recovery must be recovered, unrecovered or unknown")
+            kind = event["type"]
+            if turn not in dominant or priorities[kind] < priorities[dominant[turn]]:
+                dominant[turn] = kind
+        # Unobserved failures are not success labels. Neutral turns retain scale 1.
+        utility = 1.0 + sum((utilities[kind] - 1.0) / int(turns) for kind in dominant.values())
+        weights.append(float(np.clip(utility, config.get("min_weight", 0.5), config.get("max_weight", 2.0))))
+        detected.append(bool(dominant))
+    advantages = batch.batch["advantages"]
+    if advantages.ndim != 2 or advantages.shape[0] != len(weights) or not weights:
+        raise ValueError("Failure advantages and rollout metadata must be aligned and non-empty")
+    weight_tensor = torch.as_tensor(weights, dtype=advantages.dtype, device=advantages.device)
+    batch.batch["advantages"] = advantages * weight_tensor.unsqueeze(-1)
+    batch.batch["ttrl_failure_weight"] = weight_tensor
+    return {
+        "failure_weight_mean": float(np.mean(weights)),
+        "failure_weight_min": min(weights),
+        "failure_weight_max": max(weights),
+        "failure_detected_fraction": float(np.mean(detected)),
+    }
+
+
 def apply_ttrl_q_weights(batch, config):
     """Weight already-normalized GRPO policy advantages, preserving raw rewards/KL.
 

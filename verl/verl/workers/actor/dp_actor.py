@@ -488,6 +488,8 @@ class DataParallelPPOActor(BasePPOActor):
             "micro_batch_size": self.config.ppo_micro_batch_size_per_gpu,
             "dynamic_bsz": self.config.use_dynamic_bsz,
         }
+        if "failure_weight" in metadata:
+            objective["failure_weight"] = metadata["failure_weight"]
         metadata = {
             **metadata,
             "epoch": epoch,
