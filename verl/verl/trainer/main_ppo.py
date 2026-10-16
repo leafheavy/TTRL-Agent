@@ -230,6 +230,7 @@ class TaskRunner:
         trainer.init_workers()
         # Start the training process.
         trainer.fit()
+        trainer.serve_after_training()
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor):

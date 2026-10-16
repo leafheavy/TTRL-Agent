@@ -20,11 +20,15 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import shlex
+import tempfile
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from pprint import pprint
 from typing import Optional, Type
 
@@ -386,6 +390,7 @@ class RayPPOTrainer:
         if not isinstance(config.get("failure_mode_detection", {}).get("enabled", False), bool):
             raise ValueError("failure_mode_detection.enabled must be a boolean")
         self._validate_ttrl_config()
+        self._validate_post_train_eval_config()
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
         if config.actor_rollout_ref.actor.strategy == "megatron":
@@ -932,6 +937,81 @@ class RayPPOTrainer:
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
             )
+
+    def _validate_post_train_eval_config(self):
+        serving = self.config.trainer.get("post_train_eval", {})
+        enabled = serving.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError("trainer.post_train_eval.enabled must be a boolean")
+        if not enabled:
+            return
+        rollout = self.config.actor_rollout_ref.rollout
+        if (
+            rollout.name != "vllm"
+            or rollout.mode != "async"
+            or not rollout.get("free_cache_engine", False)
+            or self.config.actor_rollout_ref.actor.strategy not in ("fsdp", "fsdp2")
+        ):
+            raise ValueError("Post-training serving requires async vLLM, FSDP/FSDP2 and free_cache_engine=True")
+        if self.config.trainer.get("val_only", False):
+            raise ValueError("Post-training serving requires training, not trainer.val_only=True")
+        model_name = serving.get("served_model_name")
+        if model_name is not None and (not isinstance(model_name, str) or not model_name.strip()):
+            raise ValueError("trainer.post_train_eval.served_model_name must be a nonempty string or null")
+        output_dir = serving.get("output_dir")
+        if not isinstance(output_dir, str) or not output_dir.strip():
+            raise ValueError("trainer.post_train_eval.output_dir must be a writable directory")
+        output = Path(output_dir)
+        if (output / "server.env").exists() or (output / "stop").exists():
+            raise FileExistsError(f"Use a fresh post-training evaluation directory: {output}")
+        # Fail before loading models if the small connection file cannot be written.
+        output.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=output):
+            pass
+
+    def serve_after_training(self):
+        """Keep final weights in the existing rollout engine for an external evaluator."""
+        serving = self.config.trainer.get("post_train_eval", {})
+        if not serving.get("enabled", False):
+            return
+        output = Path(serving["output_dir"])
+        ready = output / "server.env"
+        stop = output / "stop"
+        if ready.exists() or stop.exists():
+            raise FileExistsError(f"Use a fresh post-training evaluation directory: {output}")
+        temporary = None
+        published = False
+        manager = self.async_rollout_manager
+        try:
+            # The last training rollout predates the last optimizer step. wake_up
+            # enters the existing FSDP sharding manager and loads the FINAL weights.
+            manager.wake_up()
+            address = manager.server_addresses[0]
+            host, port = address.rsplit(":", 1)
+            model_path = self.config.actor_rollout_ref.model.path
+            environment = {
+                "LOCAL_SERVER_ENDPOINT": host,
+                "LOCAL_SERVER_PORT": port,
+                "REMOTE_OPENAI_BASE_URL": f"http://{address}/v1",
+                "REMOTE_OPENAI_API_KEY": "EMPTY",
+                "REMOTE_OPENAI_TOKENIZER_PATH": model_path,
+                "SERVED_MODEL_NAME": serving.get("served_model_name") or "/".join(model_path.split("/")[-2:]),
+            }
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=output, delete=False) as handle:
+                temporary = Path(handle.name)
+                for name, value in environment.items():
+                    handle.write(f"export {name}={shlex.quote(str(value))}\n")
+            temporary.replace(ready)
+            published = True
+            print(f"[post_train_eval] Final weights ready: {ready}; create {stop} to stop serving.", flush=True)
+            while not stop.exists():
+                time.sleep(1)
+        finally:
+            if published:
+                ready.unlink(missing_ok=True)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            manager.sleep()
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe

@@ -62,6 +62,8 @@ class AsyncServerBase(ABC):
 
         app = fastapi.FastAPI(lifespan=lifespan)
         app.router.add_api_route("/v1/chat/completions", self.chat_completion, methods=["POST"])
+        app.router.add_api_route("/v1/completions", self.completion, methods=["POST"])
+        app.router.add_api_route("/v1/models", self.list_models, methods=["GET"])
 
         self.port = _get_free_port()
         config = uvicorn.Config(app, host=["::", "0.0.0.0"], port=self.port, log_level="warning")
@@ -72,6 +74,14 @@ class AsyncServerBase(ABC):
         """Get FastAPI server address."""
         await self.server_ready.wait()
         return f"{self.address}:{self.port}"
+
+    async def completion(self, raw_request: Request):
+        """Optional OpenAI completions API, implemented by vLLM."""
+        raise fastapi.HTTPException(status_code=501, detail="Completions API is not supported by this backend")
+
+    async def list_models(self):
+        """Optional OpenAI model listing, implemented by vLLM."""
+        raise fastapi.HTTPException(status_code=501, detail="Model listing is not supported by this backend")
 
     @abstractmethod
     async def chat_completion(self, raw_request: Request):

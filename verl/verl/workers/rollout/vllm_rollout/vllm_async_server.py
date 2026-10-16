@@ -24,8 +24,15 @@ from starlette.responses import JSONResponse, StreamingResponse
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse
+from vllm.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    CompletionRequest,
+    CompletionResponse,
+    ErrorResponse,
+)
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
@@ -201,6 +208,7 @@ class AsyncvLLMServer(AsyncServerBase):
         super().__init__()
 
         self.config = config.actor_rollout_ref
+        self.post_train_eval = config.get("trainer", {}).get("post_train_eval", {})
         self.vllm_dp_size = vllm_dp_size
         self.vllm_dp_rank = vllm_dp_rank
         self.wg_prefix = wg_prefix
@@ -268,18 +276,30 @@ class AsyncvLLMServer(AsyncServerBase):
 
         # build serving chat
         model_config = self.engine.model_config
-        BASE_MODEL_PATHS = [BaseModelPath(name=model_name, model_path=model_path)]
-        models = OpenAIServingModels(self.engine, model_config, BASE_MODEL_PATHS)
+        model_names = [model_name]
+        if self.post_train_eval.get("enabled", False):
+            # BFCL uses its local tokenizer path as request.model, even when an
+            # explicit serving alias is provided. All aliases use the same engine.
+            model_names = [self.post_train_eval.get("served_model_name") or model_name, model_name, model_path]
+        base_model_paths = [BaseModelPath(name=name, model_path=model_path) for name in dict.fromkeys(model_names)]
+        self.openai_serving_models = OpenAIServingModels(self.engine, model_config, base_model_paths)
+        request_logger = RequestLogger(max_log_len=4096)
         self.openai_serving_chat = OpenAIServingChat(
             self.engine,
             model_config,
-            models,
+            self.openai_serving_models,
             "assistant",
-            request_logger=RequestLogger(max_log_len=4096),
+            request_logger=request_logger,
             chat_template=None,
             chat_template_content_format="auto",
             enable_auto_tools=config.multi_turn.tool_config_path is not None,
             tool_parser=config.multi_turn.format,  # hermes, llama3_json, ...
+        )
+        self.openai_serving_completion = OpenAIServingCompletion(
+            self.engine,
+            model_config,
+            self.openai_serving_models,
+            request_logger=request_logger,
         )
 
     def _create_engine_config(self, engine_args: AsyncEngineArgs):
@@ -304,14 +324,25 @@ class AsyncvLLMServer(AsyncServerBase):
         request_json = await raw_request.json()
         request = ChatCompletionRequest(**request_json)
         generator = await self.openai_serving_chat.create_chat_completion(request, raw_request)
+        return self._completion_response(generator)
 
+    async def completion(self, raw_request: Request):
+        """Serve BFCL prompting handlers through the existing in-memory engine."""
+        request = CompletionRequest(**(await raw_request.json()))
+        generator = await self.openai_serving_completion.create_completion(request, raw_request)
+        return self._completion_response(generator)
+
+    async def list_models(self):
+        models = await self.openai_serving_models.show_available_models()
+        return JSONResponse(content=models.model_dump())
+
+    @staticmethod
+    def _completion_response(generator):
         if isinstance(generator, ErrorResponse):
             return JSONResponse(content=generator.model_dump(), status_code=generator.code)
-        if request.stream:
-            return StreamingResponse(content=generator, media_type="text/event-stream")
-        else:
-            assert isinstance(generator, ChatCompletionResponse)
+        if isinstance(generator, (ChatCompletionResponse, CompletionResponse)):
             return JSONResponse(content=generator.model_dump())
+        return StreamingResponse(content=generator, media_type="text/event-stream")
 
     async def generate(self, prompt_ids: List[int], sampling_params: Dict[str, Any], request_id: str) -> List[int]:
         sampling_params = dict(sampling_params)
