@@ -1,5 +1,6 @@
 """CPU checks for full-coordinate paired gradients without binary snapshots."""
 
+import csv
 import importlib.util
 import json
 import math
@@ -237,6 +238,187 @@ class TestPairedGradientConfiguration(unittest.TestCase):
         config = configuration("unknown")
         with self.assertRaisesRegex(ValueError, "mode"):
             diagnostics.validate_gradient_recording(config)
+
+
+class TestPairedBaselineHelpers(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def test_gaussian_covers_missing_gradient_coordinates_and_preserves_rng(self):
+        module = model()
+        module.first.grad = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
+        cache = diagnostics.capture_policy_gradient(module)
+        state = torch.random.get_rng_state().clone()
+        first = diagnostics.random_gradient_statistics(cache, seed=17)
+        repeated = diagnostics.random_gradient_statistics(cache, seed=17)
+        other_rank = diagnostics.random_gradient_statistics(cache, seed=17, rank=1)
+        self.assertTrue(torch.equal(torch.random.get_rng_state(), state))
+        torch.testing.assert_close(first, repeated, rtol=0, atol=0)
+        self.assertFalse(torch.equal(first, other_rank))
+        self.assertEqual(first.dtype, torch.float64)
+        self.assertEqual(first.shape, (3,))
+        self.assertEqual(first[1].item(), 14)
+        self.assertIsNone(cache["parameters"][1]["gradient"])
+        restricted = {**cache, "parameters": cache["parameters"][:1], "numel": 3}
+        restricted_statistics = diagnostics.random_gradient_statistics(restricted, seed=17)
+        torch.testing.assert_close(first[:2], restricted_statistics[:2], rtol=0, atol=0)
+        self.assertGreater(first[2].item(), restricted_statistics[2].item())
+        module.second.grad = torch.zeros(2, dtype=torch.float64)
+        explicit_zero = diagnostics.random_gradient_statistics(diagnostics.capture_policy_gradient(module), seed=17)
+        torch.testing.assert_close(first, explicit_zero, rtol=0, atol=0)
+        with patch.object(diagnostics, "CHUNK_SIZE", 1):
+            rechunked = diagnostics.random_gradient_statistics(diagnostics.capture_policy_gradient(module), seed=17)
+        torch.testing.assert_close(first, rechunked, rtol=0, atol=0)
+
+    def test_gaussian_remains_nonzero_when_supervised_gradient_is_zero(self):
+        cache = diagnostics.capture_policy_gradient(model())
+        values = diagnostics.random_gradient_statistics(cache, seed=19)
+        self.assertEqual(values[0].item(), 0)
+        self.assertEqual(values[1].item(), 0)
+        self.assertGreater(values[2].item(), 0)
+        result = diagnostics.save_paired_gradient_statistics(
+            torch.zeros(3, dtype=torch.float64), batch(), metadata(), self.root / "zero",
+            cache=cache, baselines={"random_direction": values, "shuffled_labels": torch.zeros(3)},
+        )
+        self.assertEqual(result["baselines"]["random_direction"]["status"], "supervised_zero")
+        self.assertEqual(result["baselines"]["random_direction"]["unsupervised_norm"], 1)
+        self.assertEqual(result["baselines"]["shuffled_labels"]["status"], "both_zero")
+        for baseline in result["baselines"].values():
+            self.assertIsNone(baseline["cosine"])
+            self.assertIsNone(baseline["angle_deg"])
+
+    def test_baselines_reduce_global_statistics_before_normalizing_gaussian(self):
+        remotes = iter(([-1, 4, 1], [-1, 4, 11], [2, 4, 5]))
+
+        def reduce(values, op):
+            values.add_(torch.tensor(next(remotes), dtype=torch.float64))
+
+        def gather(values, local):
+            values[:] = [local, {**local, "rank": 1, "numel": 7}]
+
+        baselines = {
+            "random_direction": torch.tensor([3, 9, 25], dtype=torch.float64),
+            "shuffled_labels": torch.tensor([-4, 9, 4], dtype=torch.float64),
+        }
+        baseline_metadata = {"seed": 41, "draws_per_update": 1}
+        with patch.object(torch.distributed, "all_reduce", side_effect=reduce) as reduction:
+            with patch.object(torch.distributed, "all_gather_object", side_effect=gather):
+                result = diagnostics.save_paired_gradient_statistics(
+                    torch.tensor([6, 9, 4], dtype=torch.float64), batch(), metadata(), self.root / "distributed",
+                    cache=diagnostics.capture_policy_gradient(model()), world_size=2,
+                    baselines=baselines, baseline_metadata=baseline_metadata,
+                )
+        self.assertEqual(reduction.call_count, 3)
+        self.assertEqual(result["dot_product"], 5)
+        self.assertEqual(result["numel"], 12)
+        random = result["baselines"]["random_direction"]
+        self.assertAlmostEqual(random["dot_product"], 1 / 3)
+        self.assertEqual(random["supervised_squared_norm"], 13)
+        self.assertEqual(random["unsupervised_squared_norm"], 1)
+        self.assertAlmostEqual(random["cosine"], 1 / (3 * math.sqrt(13)))
+        shuffled = result["baselines"]["shuffled_labels"]
+        self.assertEqual(shuffled["dot_product"], -2)
+        self.assertAlmostEqual(shuffled["cosine"], -2 / math.sqrt(117))
+        self.assertEqual(result["baseline_metadata"], baseline_metadata)
+        torch.testing.assert_close(baselines["random_direction"], torch.tensor([3, 9, 25], dtype=torch.float64))
+
+    def test_export_mixes_old_records_with_new_baseline_columns(self):
+        directory = self.root / "mixed"
+        cache = diagnostics.capture_policy_gradient(model())
+        diagnostics.save_paired_gradient_statistics(
+            torch.tensor([0, 4, 4], dtype=torch.float64), batch(), metadata(), directory, cache=cache
+        )
+        diagnostics.save_paired_gradient_statistics(
+            torch.tensor([2, 4, 4], dtype=torch.float64), batch(), {**metadata(), "step": 2}, directory,
+            cache=cache,
+            baselines={
+                "random_direction": torch.tensor([2, 4, 16], dtype=torch.float64),
+                "shuffled_labels": torch.tensor([-2, 4, 4], dtype=torch.float64),
+            },
+            baseline_metadata={"seed": 17},
+        )
+        destination = self.root / "export"
+        csv_path = diagnostics.compare_paired_run(directory, destination)
+        with csv_path.open(encoding="utf-8", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["random_direction_cosine"], "")
+        self.assertEqual(rows[0]["shuffled_labels_cosine"], "")
+        self.assertAlmostEqual(float(rows[1]["cosine"]), 0.5)
+        self.assertAlmostEqual(float(rows[1]["random_direction_cosine"]), 0.25)
+        self.assertAlmostEqual(float(rows[1]["shuffled_labels_cosine"]), -0.5)
+        self.assertEqual(rows[1]["random_direction_unsupervised_norm"], "1.0")
+        self.assertEqual(rows[1]["baseline_seed"], "17")
+        self.assertGreater((destination / "gradient_comparison.png").stat().st_size, 1000)
+
+
+class TestTrajectoryExportAndConfiguration(unittest.TestCase):
+    def test_existing_paired_export_handles_trajectory_only_records_and_null_directions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "trajectory"
+            module = nn.Linear(2, 1, bias=False, dtype=torch.float64)
+            with torch.no_grad():
+                module.weight.zero_()
+            optimizer = torch.optim.AdamW(module.parameters())
+            trajectory = diagnostics.OptimizationTrajectory(module, optimizer)
+            records = []
+            for step, supervised_delta, unsupervised_delta in (
+                (1, [0, 0], [1, 0]),
+                (2, [1, 1], [-1, 0]),
+            ):
+                def supervised_update(supervised_delta=supervised_delta):
+                    with torch.no_grad():
+                        module.weight.add_(torch.tensor([supervised_delta], dtype=torch.float64))
+
+                trajectory.supervised_step(module, optimizer, supervised_update)
+                with torch.no_grad():
+                    module.weight.add_(torch.tensor([unsupervised_delta], dtype=torch.float64))
+                record = trajectory.finish_step(module, {"step": step, "epoch": 0, "minibatch": 0})
+                diagnostics.save_trajectory_statistics(record, directory)
+                records.append(record)
+            self.assertIsNone(records[0]["endpoint"]["cosine"])
+            self.assertIsNone(records[0]["path"]["cosine"])
+            self.assertIsNone(records[1]["endpoint"]["cosine"])
+            self.assertAlmostEqual(records[1]["path"]["cosine"], -0.5)
+            saved = sorted(directory.glob("trajectory_step_*.json"))
+            self.assertEqual(len(saved), 2)
+            self.assertIsNone(json.loads(saved[0].read_text(encoding="utf-8"))["endpoint"]["cosine"])
+            self.assertFalse(list(directory.glob("step_*.json")))
+            destination = Path(temporary) / "export"
+            path = diagnostics.compare_paired_run(directory, destination)
+            self.assertEqual(path.name, "trajectory_comparison.csv")
+            with path.open(encoding="utf-8", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["endpoint_cosine"], "")
+            self.assertEqual(rows[0]["path_cosine"], "")
+            self.assertEqual(rows[0]["endpoint_status"], "supervised_zero")
+            self.assertEqual(rows[1]["endpoint_cosine"], "")
+            self.assertEqual(rows[1]["endpoint_status"], "unsupervised_zero")
+            self.assertAlmostEqual(float(rows[1]["path_cosine"]), -0.5)
+            self.assertEqual(float(rows[1]["endpoint_dot_product"]), 0)
+            self.assertEqual(float(rows[1]["path_dot_product"]), -1)
+            self.assertEqual(rows[1]["updates"], "2")
+            self.assertGreater((destination / "trajectory_comparison.png").stat().st_size, 1000)
+
+    def test_trajectory_requires_paired_fsdp1_while_ordinary_paired_fsdp2_remains_supported(self):
+        config = configuration()
+        config.actor_rollout_ref.actor.strategy = "fsdp2"
+        diagnostics.validate_gradient_recording(config)
+        config.actor_rollout_ref.actor.gradient_record["trajectory"] = {"enabled": False}
+        diagnostics.validate_gradient_recording(config)
+        for mode, strategy in (("paired", "fsdp2"), ("full", "fsdp"), ("full", "fsdp2")):
+            with self.subTest(mode=mode, strategy=strategy):
+                config = configuration(mode)
+                config.actor_rollout_ref.actor.strategy = strategy
+                config.actor_rollout_ref.actor.gradient_record["trajectory"] = {"enabled": True}
+                with self.assertRaisesRegex(ValueError, "mode=paired and strategy=fsdp"):
+                    diagnostics.validate_gradient_recording(config)
+        config = configuration()
+        config.actor_rollout_ref.actor.gradient_record["trajectory"] = {"enabled": True}
+        diagnostics.validate_gradient_recording(config)
 
 
 if __name__ == "__main__":

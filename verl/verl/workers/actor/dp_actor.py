@@ -521,7 +521,9 @@ class DataParallelPPOActor(BasePPOActor):
         """Compare both rewards at identical parameters without storing gradient files."""
         from verl.utils.gradient_diagnostics import (
             capture_policy_gradient,
+            diagnostic_seed,
             paired_gradient_statistics,
+            random_gradient_statistics,
             save_paired_gradient_statistics,
         )
 
@@ -529,6 +531,11 @@ class DataParallelPPOActor(BasePPOActor):
         if supervised.shape != tensors["advantages"].shape:
             raise ValueError("Paired policy gradients require identically shaped advantages")
         cache = None
+        baselines = {}
+        baseline_config = self.gradient_record_config.get("baselines", {})
+        baseline_seed = diagnostic_seed(
+            baseline_config.get("seed", 0), metadata["step"], metadata["epoch"], metadata["minibatch"]
+        )
         try:
             # Separate RNG forks start both passes at the same dropout state and
             # leave the subsequent optimizer update's random sequence unchanged.
@@ -542,6 +549,17 @@ class DataParallelPPOActor(BasePPOActor):
                     advantages_key="diagnostic_supervised_advantages",
                 )
                 cache = capture_policy_gradient(self.actor_module)
+            if baseline_config.get("enabled", False):
+                baselines["random_direction"] = random_gradient_statistics(
+                    cache, seed=baseline_seed, rank=torch.distributed.get_rank()
+                )
+                with torch.random.fork_rng(devices=devices, device_type=self.device_name):
+                    self.actor_optimizer.zero_grad()
+                    self._backward_micro_batches(
+                        micro_batches, temperature, None, policy_only=True,
+                        advantages_key="diagnostic_shuffled_advantages",
+                    )
+                    baselines["shuffled_labels"] = paired_gradient_statistics(self.actor_module, cache)
             with torch.random.fork_rng(devices=devices, device_type=self.device_name):
                 self.actor_optimizer.zero_grad()
                 self._backward_micro_batches(micro_batches, temperature, None, policy_only=True)
@@ -555,10 +573,50 @@ class DataParallelPPOActor(BasePPOActor):
                     rank=torch.distributed.get_rank(),
                     world_size=torch.distributed.get_world_size(),
                     device=torch.device(self.device_name, devices[0]) if devices else None,
+                    baselines=baselines,
+                    baseline_metadata={
+                        "seed": baseline_seed,
+                        "random_direction": "independent_isotropic_gaussian_global_unit_l2",
+                        "draws_per_update": 1,
+                        "shuffled_labels": metadata.get("shuffled_labels", {}),
+                    },
                 )
         finally:
             self.actor_optimizer.zero_grad()
             cache = None
+
+    def _advance_supervised_trajectory(self, micro_batches, temperature, devices):
+        from verl.utils.gradient_diagnostics import OptimizationTrajectory
+
+        if not hasattr(self, "optimization_trajectory"):
+            self.optimization_trajectory = OptimizationTrajectory(self.actor_module, self.actor_optimizer)
+
+        def update():
+            self._backward_micro_batches(
+                micro_batches, temperature, {}, advantages_key="diagnostic_supervised_advantages"
+            )
+            self._optimizer_step()
+
+        with torch.random.fork_rng(devices=devices, device_type=self.device_name):
+            self.optimization_trajectory.supervised_step(self.actor_module, self.actor_optimizer, update)
+
+    def _finish_optimization_trajectory(self, metadata, epoch, batch_idx):
+        from verl.utils.gradient_diagnostics import recording_due, save_trajectory_statistics
+
+        devices = [get_device_id()] if self.device_name != "cpu" else []
+        result = self.optimization_trajectory.finish_step(
+            self.actor_module,
+            {**metadata, "epoch": epoch, "minibatch": batch_idx,
+             "learning_rates": [group["lr"] for group in self.actor_optimizer.param_groups],
+             "optimizer": type(self.actor_optimizer).__name__},
+            rank=torch.distributed.get_rank(),
+            world_size=torch.distributed.get_world_size(),
+            device=torch.device(self.device_name, devices[0]) if devices else None,
+        )
+        if recording_due(self.gradient_record_config, metadata["step"]) or metadata.get("final_step", False):
+            save_trajectory_statistics(
+                result, self.gradient_record_config["output_dir"], rank=torch.distributed.get_rank()
+            )
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -567,6 +625,13 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         gradient_metadata = data.meta_info.get("gradient_record")
+        if gradient_metadata is not None:
+            gradient_metadata = {**gradient_metadata, "shuffled_labels": data.meta_info.get("gradient_baselines", {})}
+        record_trajectory = bool(
+            self.gradient_record_config.get("enabled", False)
+            and self.gradient_record_config.get("mode", "full") == "paired"
+            and self.gradient_record_config.get("trajectory", {}).get("enabled", False)
+        )
         record_gradient = False
         if self.gradient_record_config.get("enabled", False):
             from verl.utils.gradient_diagnostics import recording_due
@@ -586,10 +651,14 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-        if record_gradient and self.gradient_record_config.get("mode", "full") == "paired":
+        if (record_gradient or record_trajectory) and self.gradient_record_config.get("mode", "full") == "paired":
             if "diagnostic_supervised_advantages" not in data.batch:
                 raise ValueError("Paired policy gradients require trainer-provided supervised advantages")
             select_keys.append("diagnostic_supervised_advantages")
+            if record_gradient and self.gradient_record_config.get("baselines", {}).get("enabled", False):
+                if "diagnostic_shuffled_advantages" not in data.batch:
+                    raise ValueError("Paired baselines require trainer-provided shuffled advantages")
+                select_keys.append("diagnostic_shuffled_advantages")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -647,10 +716,15 @@ class DataParallelPPOActor(BasePPOActor):
                     self._record_policy_gradient(
                         micro_batches, mini_batch, temperature, gradient_metadata, epoch, batch_idx
                     )
+                if record_trajectory:
+                    devices = [get_device_id()] if self.device_name != "cpu" else []
+                    self._advance_supervised_trajectory(micro_batches, temperature, devices)
                 self.actor_optimizer.zero_grad()
                 self._backward_micro_batches(micro_batches, temperature, metrics)
 
                 grad_norm = self._optimizer_step()
+                if record_trajectory:
+                    self._finish_optimization_trajectory(gradient_metadata, epoch, batch_idx)
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()

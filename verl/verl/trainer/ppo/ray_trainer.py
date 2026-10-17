@@ -1244,8 +1244,8 @@ class RayPPOTrainer:
         record = self.config.actor_rollout_ref.get("actor", {}).get("gradient_record", {})
         if not record.get("enabled", False) or record.get("mode", "full") != "paired":
             return False
-        return self.global_steps >= self.config.trainer.critic_warmup and paired_recording_due(
-            record, self.global_steps
+        return self.global_steps >= self.config.trainer.critic_warmup and (
+            record.get("trajectory", {}).get("enabled", False) or paired_recording_due(record, self.global_steps)
         )
 
     def _prepare_paired_gradient_advantages(self, batch: DataProto):
@@ -1265,6 +1265,23 @@ class RayPPOTrainer:
             norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
         )
         batch.batch["diagnostic_supervised_advantages"] = advantages
+        baselines = record.get("baselines", {})
+        if baselines.get("enabled", False):
+            from verl.utils.gradient_diagnostics import diagnostic_seed, shuffle_outcome_rewards
+
+            shuffled_rewards, metadata = shuffle_outcome_rewards(
+                rewards,
+                batch.non_tensor_batch["uid"],
+                seed=diagnostic_seed(baselines.get("seed", 0), "shuffled_labels", self.global_steps),
+            )
+            shuffled_advantages, _ = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=shuffled_rewards,
+                response_mask=batch.batch["response_mask"],
+                index=batch.non_tensor_batch["uid"],
+                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+            )
+            batch.batch["diagnostic_shuffled_advantages"] = shuffled_advantages
+            batch.meta_info["gradient_baselines"] = metadata
 
     def _generate_training_rollouts(self, batch: DataProto, gen_batch: DataProto):
         """Generate once, then reuse that output for TTRL voting and GRPO."""
@@ -1631,6 +1648,7 @@ class RayPPOTrainer:
                                 )
                                 batch.meta_info["gradient_record"] = {
                                     "step": self.global_steps,
+                                    "final_step": is_last_step,
                                     "reward_source": "bfcl_supervised"
                                     if self.config.get("bfcl_supervised", {}).get("enabled", False)
                                     else "ttrl_" + ttrl.get("reward_mode", "math")

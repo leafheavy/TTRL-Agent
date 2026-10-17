@@ -215,6 +215,17 @@ actor_rollout_ref:
       # full: legacy FP32 gradient files; paired: same-rollout BFCL/TTRL statistics only.
       mode: full
 
+      # Same-point paired null references; no changes to the actual update.
+      baselines:
+        enabled: true
+        seed: 0
+
+      # Independent supervised optimizer branch sharing the TTRL rollouts.
+      # CPU parameter/optimizer snapshots are expensive; FSDP1 only.
+      # When enabled, score and advance EVERY minibatch; interval only controls output.
+      trajectory:
+        enabled: false
+
       # Derived from the run directory; only enabled is needed to toggle recording.
       # All ranks share this directory on multi-GPU jobs.
       output_dir: ${trainer.default_local_dir}/gradients

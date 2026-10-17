@@ -5,6 +5,7 @@ from production source and exercised with real PyTorch backward/AdamW.
 """
 
 import ast
+import copy
 import hashlib
 import importlib.util
 import json
@@ -102,6 +103,8 @@ def actor_class():
             "_backward_micro_batches",
             "_record_policy_gradient",
             "_record_paired_policy_gradient",
+            "_advance_supervised_trajectory",
+            "_finish_optimization_trajectory",
             "_optimizer_step",
         },
     )
@@ -332,6 +335,74 @@ class TestPolicyGradientRecording(unittest.TestCase):
         backward.assert_not_called()
         self.assertFalse((self.root / "missing").exists())
 
+    def test_trajectory_preserves_three_training_updates_moments_rng_and_metrics(self):
+        ordinary = make_actor(False, self.root / "ordinary")
+        recorded = make_actor(False, self.root / "trajectory", mode="paired")
+        for actor in (ordinary, recorded):
+            torch.manual_seed(100)
+            actor.update_policy(sample_batch())
+        recorded.gradient_record_config.update(
+            enabled=True, interval=3, trajectory={"enabled": True}
+        )
+        verifier = TestOptimizationTrajectory()
+        for step, learning_rate in enumerate((0.01, 0.003, 0.008), start=1):
+            ordinary.actor_optimizer.param_groups[0]["lr"] = learning_rate
+            recorded.actor_optimizer.param_groups[0]["lr"] = learning_rate
+            torch.manual_seed(200 + step)
+            expected_metrics = ordinary.update_policy(sample_batch(step))
+            expected_rng = torch.random.get_rng_state()
+            torch.manual_seed(200 + step)
+            actual_metrics = recorded.update_policy(paired_batch(step))
+            verifier.assert_state_equal(recorded.actor_module.state_dict(), ordinary.actor_module.state_dict())
+            verifier.assert_state_equal(recorded.actor_optimizer.state_dict(), ordinary.actor_optimizer.state_dict())
+            self.assertTrue(torch.equal(torch.random.get_rng_state(), expected_rng))
+            self.assertEqual(actual_metrics, expected_metrics)
+        records = sorted((self.root / "trajectory").glob("trajectory_step_*.json"))
+        self.assertEqual(len(records), 2)
+        final_record = json.loads(records[-1].read_text(encoding="utf-8"))
+        self.assertEqual(final_record["updates"], 3)
+        self.assertEqual(final_record["start_update"], "step_000001_epoch_000_minibatch_0000")
+        self.assertEqual(final_record["end_update"], "step_000003_epoch_000_minibatch_0000")
+
+    def test_trajectory_failure_restores_real_training_state_and_rng(self):
+        actor = make_actor(False, self.root / "trajectory_failure", mode="paired")
+        torch.manual_seed(100)
+        actor.update_policy(sample_batch())
+        actor.gradient_record_config.update(enabled=True, interval=10, trajectory={"enabled": True})
+        original_parameters = copy.deepcopy(actor.actor_module.state_dict())
+        original_optimizer = copy.deepcopy(actor.actor_optimizer.state_dict())
+        original_step = actor._optimizer_step
+
+        def failing_optimizer_step():
+            original_step()
+            raise RuntimeError("shadow optimizer failed after updating")
+
+        torch.manual_seed(205)
+        original_rng = torch.random.get_rng_state()
+        with patch.object(actor, "_optimizer_step", side_effect=failing_optimizer_step):
+            with self.assertRaisesRegex(RuntimeError, "shadow optimizer failed"):
+                actor.update_policy(paired_batch(step=2))
+        verifier = TestOptimizationTrajectory()
+        verifier.assert_state_equal(actor.actor_module.state_dict(), original_parameters)
+        verifier.assert_state_equal(actor.actor_optimizer.state_dict(), original_optimizer)
+        self.assertTrue(torch.equal(torch.random.get_rng_state(), original_rng))
+        self.assertTrue(all(parameter.grad is None for parameter in actor.actor_module.parameters()))
+        self.assertFalse((self.root / "trajectory_failure").exists())
+
+    def test_final_step_writes_trajectory_outside_gradient_recording_interval(self):
+        actor = make_actor(True, self.root / "trajectory_final", mode="paired")
+        actor.gradient_record_config.update(interval=10, trajectory={"enabled": True})
+        batch = paired_batch(step=2)
+        batch.meta_info["gradient_record"]["final_step"] = True
+        actor.update_policy(batch)
+        files = list((self.root / "trajectory_final").glob("*.json"))
+        self.assertEqual(len(files), 1)
+        self.assertTrue(files[0].name.startswith("trajectory_step_000002"))
+        record = json.loads(files[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["updates"], 1)
+        self.assertEqual(record["start_update"], "step_000002_epoch_000_minibatch_0000")
+        self.assertEqual(record["end_update"], "step_000002_epoch_000_minibatch_0000")
+
     def test_paired_failure_restores_rng_and_clears_disposable_gradients(self):
         actor = make_actor(True, self.root / "failed", mode="paired")
         parameters = [parameter.detach().clone() for parameter in actor.actor_module.parameters()]
@@ -418,6 +489,324 @@ class TestGradientComparison(unittest.TestCase):
         csv_path = diagnostics.compare_runs(self.root / "a", self.root / "b", output)
         self.assertIn("angle_deg", csv_path.read_text(encoding="utf-8"))
         self.assertGreater((output / "gradient_comparison.png").stat().st_size, 1000)
+
+
+class TestOptimizationTrajectory(unittest.TestCase):
+    """Check genuine independent optimization against two ordinary AdamW models."""
+
+    @staticmethod
+    def parameters(module):
+        return torch.cat([parameter.detach().reshape(-1).double() for parameter in module.parameters()])
+
+    def assert_state_equal(self, actual, expected):
+        if isinstance(actual, torch.Tensor):
+            self.assertTrue(torch.equal(actual, expected))
+        elif isinstance(actual, dict):
+            self.assertEqual(actual.keys(), expected.keys())
+            for key in actual:
+                self.assert_state_equal(actual[key], expected[key])
+        elif isinstance(actual, (tuple, list)):
+            self.assertEqual(len(actual), len(expected))
+            for left, right in zip(actual, expected):
+                self.assert_state_equal(left, right)
+        else:
+            self.assertEqual(actual, expected)
+
+    @staticmethod
+    def model():
+        module = nn.Linear(2, 2, bias=True, dtype=torch.float64)
+        with torch.no_grad():
+            module.weight.copy_(torch.tensor([[0.6, -0.4], [0.2, 0.3]], dtype=torch.float64))
+            module.bias.copy_(torch.tensor([0.1, -0.2], dtype=torch.float64))
+        module.register_buffer("forward_count", torch.zeros((), dtype=torch.int64))
+        return module
+
+    @staticmethod
+    def optimizer(module):
+        return torch.optim.AdamW(module.parameters(), lr=0.02, betas=(0.7, 0.85), weight_decay=0.13, eps=1e-7)
+
+    @staticmethod
+    def optimization_step(module, optimizer, target):
+        inputs = torch.tensor([[1.0, -0.5], [0.2, 0.8], [-0.7, 1.1]], dtype=torch.float64)
+        optimizer.zero_grad()
+        module.forward_count.add_(1)
+        prediction = module(inputs)
+        regularizer = 0.07 * sum(parameter.square().sum() for parameter in module.parameters())
+        loss = (prediction - target).square().mean() + regularizer
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(module.parameters(), 0.15)
+        optimizer.step()
+
+    def test_three_adamw_steps_match_independent_models_and_endpoint_path_formulas(self):
+        module = self.model()
+        optimizer = self.optimizer(module)
+        warmup_target = torch.tensor([[0.4, 0.3], [0.1, -0.2], [-0.5, 0.2]], dtype=torch.float64)
+        self.optimization_step(module, optimizer, warmup_target)
+        self.assertTrue(optimizer.state)
+        initial = self.parameters(module)
+
+        supervised = copy.deepcopy(module)
+        supervised_optimizer = self.optimizer(supervised)
+        supervised_optimizer.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+        unsupervised = copy.deepcopy(module)
+        unsupervised_optimizer = self.optimizer(unsupervised)
+        unsupervised_optimizer.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+        trajectory = diagnostics.OptimizationTrajectory(module, optimizer)
+        supervised_increments, unsupervised_increments = [], []
+
+        for index, learning_rate in enumerate((0.02, 0.007, 0.011), start=1):
+            for current_optimizer in (optimizer, supervised_optimizer, unsupervised_optimizer):
+                current_optimizer.param_groups[0]["lr"] = learning_rate
+            supervised_target = torch.tensor([[0.9, -0.1], [-0.4, 0.7], [0.3, -0.8]], dtype=torch.float64) * index
+            unsupervised_target = torch.tensor([[-0.7, 0.8], [0.5, -0.2], [-0.1, 0.6]], dtype=torch.float64) / index
+            supervised_before = self.parameters(supervised)
+            unsupervised_before = self.parameters(unsupervised)
+            actual_before = copy.deepcopy(module.state_dict())
+            optimizer_before = copy.deepcopy(optimizer.state_dict())
+            self.optimization_step(supervised, supervised_optimizer, supervised_target)
+
+            def supervised_update(supervised_target=supervised_target):
+                self.optimization_step(module, optimizer, supervised_target)
+                torch.testing.assert_close(self.parameters(module), self.parameters(supervised), rtol=0, atol=0)
+                self.assert_state_equal(optimizer.state_dict(), supervised_optimizer.state_dict())
+                self.assertEqual(module.forward_count.item(), supervised.forward_count.item())
+
+            trajectory.supervised_step(module, optimizer, supervised_update)
+            self.assert_state_equal(module.state_dict(), actual_before)
+            self.assert_state_equal(optimizer.state_dict(), optimizer_before)
+            self.assertTrue(all(parameter.grad is None for parameter in module.parameters()))
+
+            self.optimization_step(module, optimizer, unsupervised_target)
+            self.optimization_step(unsupervised, unsupervised_optimizer, unsupervised_target)
+            self.assert_state_equal(module.state_dict(), unsupervised.state_dict())
+            self.assert_state_equal(optimizer.state_dict(), unsupervised_optimizer.state_dict())
+            supervised_increments.append(self.parameters(supervised) - supervised_before)
+            unsupervised_increments.append(self.parameters(unsupervised) - unsupervised_before)
+            record = trajectory.finish_step(module, {"step": index, "epoch": 0, "minibatch": 0})
+
+            endpoint_left = self.parameters(supervised) - initial
+            endpoint_right = self.parameters(unsupervised) - initial
+            path_left, path_right = torch.cat(supervised_increments), torch.cat(unsupervised_increments)
+            for field, left, right in (("endpoint", endpoint_left, endpoint_right), ("path", path_left, path_right)):
+                expected = diagnostics._comparison_statistics(
+                    torch.dot(left, right).item(), torch.dot(left, left).item(), torch.dot(right, right).item()
+                )
+                self.assertEqual(record[field]["status"], expected["status"])
+                for statistic in (
+                    "dot_product", "supervised_squared_norm", "unsupervised_squared_norm", "cosine", "angle_deg"
+                ):
+                    self.assertAlmostEqual(record[field][statistic], expected[statistic], places=13)
+            self.assertEqual(record["updates"], index)
+
+        self.assertFalse(torch.equal(self.parameters(supervised), self.parameters(unsupervised)))
+
+    def test_supervised_failure_restores_parameters_buffers_and_adamw_state(self):
+        module = self.model()
+        optimizer = self.optimizer(module)
+        target = torch.zeros(3, 2, dtype=torch.float64)
+        self.optimization_step(module, optimizer, target)
+        trajectory = diagnostics.OptimizationTrajectory(module, optimizer)
+        original_parameters = copy.deepcopy(module.state_dict())
+        original_optimizer = copy.deepcopy(optimizer.state_dict())
+
+        def failing_update():
+            self.optimization_step(module, optimizer, target + 3)
+            raise RuntimeError("supervised branch failed")
+
+        with self.assertRaisesRegex(RuntimeError, "supervised branch failed"):
+            trajectory.supervised_step(module, optimizer, failing_update)
+        self.assert_state_equal(module.state_dict(), original_parameters)
+        self.assert_state_equal(optimizer.state_dict(), original_optimizer)
+        self.assertTrue(all(parameter.grad is None for parameter in module.parameters()))
+
+    def test_global_endpoint_and_path_statistics_sum_coordinate_shards(self):
+        module = nn.Linear(2, 1, bias=False, dtype=torch.float64)
+        with torch.no_grad():
+            module.weight.zero_()
+        optimizer = torch.optim.AdamW(module.parameters())
+        trajectory = diagnostics.OptimizationTrajectory(module, optimizer)
+        remote_statistics = (
+            torch.tensor([0, 2, 2, 0, 2, 2], dtype=torch.float64),
+            torch.tensor([3, 5, 2, 0, 3, 6], dtype=torch.float64),
+        )
+        for step, (supervised_delta, unsupervised_delta) in enumerate(
+            (([1, 0], [0, 2]), ([0, 3], [4, 0])), start=1
+        ):
+            def shadow_update(supervised_delta=supervised_delta):
+                with torch.no_grad():
+                    module.weight.add_(torch.tensor([supervised_delta], dtype=torch.float64))
+
+            trajectory.supervised_step(module, optimizer, shadow_update)
+            with torch.no_grad():
+                module.weight.add_(torch.tensor([unsupervised_delta], dtype=torch.float64))
+
+            def reduction(statistics, op, step=step):
+                statistics.add_(remote_statistics[step - 1])
+
+            with patch.object(torch.distributed, "all_reduce", side_effect=reduction) as reduce:
+                record = trajectory.finish_step(
+                    module, {"step": step, "epoch": 0, "minibatch": 0}, world_size=2
+                )
+            self.assertEqual(reduce.call_args.args[0].numel(), 6)
+        expected_endpoint = diagnostics._comparison_statistics(13, 15, 22)
+        expected_path = diagnostics._comparison_statistics(0, 13, 26)
+        self.assertEqual(record["endpoint"], expected_endpoint)
+        self.assertEqual(record["path"], expected_path)
+
+    def test_zero_learning_rate_keeps_both_trajectory_directions_undefined(self):
+        module = self.model()
+        optimizer = self.optimizer(module)
+        optimizer.param_groups[0]["lr"] = 0
+        trajectory = diagnostics.OptimizationTrajectory(module, optimizer)
+        trajectory.supervised_step(
+            module, optimizer,
+            lambda: self.optimization_step(module, optimizer, torch.ones(3, 2, dtype=torch.float64)),
+        )
+        self.optimization_step(module, optimizer, torch.zeros(3, 2, dtype=torch.float64))
+        record = trajectory.finish_step(module, {"step": 1, "epoch": 0, "minibatch": 0})
+        for field in ("endpoint", "path"):
+            self.assertEqual(record[field]["status"], "both_zero")
+            self.assertIsNone(record[field]["cosine"])
+            self.assertIsNone(record[field]["angle_deg"])
+
+
+class TestPairedRandomBaselines(unittest.TestCase):
+    def setUp(self):
+        TestPolicyGradientRecording.setUp(self)
+
+    @staticmethod
+    def baseline_batch(step=1):
+        batch = paired_batch(step)
+        batch.batch["diagnostic_shuffled_advantages"] = torch.tensor(
+            [[-1.0, 0.0], [1.0, 1.0], [1.0, 0.0], [-1.0, -1.0]]
+        )
+        batch.meta_info["gradient_baselines"] = {
+            "seed": 29, "shuffle_scope": "within_prompt_uid", "changed_label_count": 4,
+        }
+        return batch
+
+    def assert_training_state_equal(self, actual, expected):
+        def equal(left, right):
+            if isinstance(left, torch.Tensor):
+                self.assertTrue(torch.equal(left, right))
+            elif isinstance(left, dict):
+                self.assertEqual(left.keys(), right.keys())
+                for key in left:
+                    equal(left[key], right[key])
+            elif isinstance(left, (list, tuple)):
+                self.assertEqual(len(left), len(right))
+                for one, two in zip(left, right):
+                    equal(one, two)
+            else:
+                self.assertEqual(left, right)
+
+        equal(actual.actor_module.state_dict(), expected.actor_module.state_dict())
+        equal(actual.actor_optimizer.state_dict(), expected.actor_optimizer.state_dict())
+
+    def test_two_baselines_match_manual_gradients_and_record_auditable_seeds(self):
+        batch = self.baseline_batch()
+        supervised = manual_policy_gradient(batch, supervised=True)
+        shuffled_batch = Batch({**batch.batch, "advantages": batch.batch["diagnostic_shuffled_advantages"]})
+        shuffled = manual_policy_gradient(shuffled_batch)
+        expected_shuffled = diagnostics._comparison_statistics(
+            torch.dot(supervised, shuffled).item(),
+            torch.dot(supervised, supervised).item(),
+            torch.dot(shuffled, shuffled).item(),
+        )
+        reference = make_actor(False, "unused")
+        reference.actor_module.train()
+        reference.gradient_accumulation = 2
+        torch.manual_seed(101)
+        reference._backward_micro_batches(
+            batch.batch.split(2), 1.0, None, policy_only=True, advantages_key="diagnostic_supervised_advantages"
+        )
+        seed = diagnostics.diagnostic_seed(23, 1, 0, 0)
+        random_values = diagnostics.random_gradient_statistics(
+            diagnostics.capture_policy_gradient(reference.actor_module), seed=seed
+        )
+        expected_random = diagnostics._comparison_statistics(
+            random_values[0].item() / math.sqrt(random_values[2].item()), random_values[1].item(), 1
+        )
+        actor = make_actor(True, self.root / "baselines", mode="paired")
+        actor.gradient_record_config["baselines"] = {"enabled": True, "seed": 23}
+        torch.manual_seed(101)
+        with patch.object(actor, "_backward_micro_batches", wraps=actor._backward_micro_batches) as backward:
+            actor.update_policy(batch)
+        self.assertEqual(backward.call_count, 4)
+        paths = list((self.root / "baselines").glob("*.json"))
+        self.assertEqual(len(paths), 1)
+        result = json.loads(paths[0].read_text(encoding="utf-8"))
+        self.assertEqual(set(result["baselines"]), {"random_direction", "shuffled_labels"})
+        for name, expected in (("random_direction", expected_random), ("shuffled_labels", expected_shuffled)):
+            actual = result["baselines"][name]
+            self.assertEqual(actual["status"], expected["status"])
+            for field in ("dot_product", "supervised_squared_norm", "unsupervised_squared_norm", "cosine"):
+                self.assertAlmostEqual(actual[field], expected[field], places=14)
+        self.assertEqual(result["baseline_metadata"]["seed"], seed)
+        self.assertEqual(result["baseline_metadata"]["draws_per_update"], 1)
+        self.assertEqual(result["baseline_metadata"]["shuffled_labels"], batch.meta_info["gradient_baselines"])
+        self.assertFalse(list((self.root / "baselines").rglob("*.bin")))
+
+    def test_baselines_preserve_adamw_moments_parameters_dropout_rng_and_metrics(self):
+        ordinary = make_actor(False, self.root / "off")
+        recorded = make_actor(False, self.root / "on", mode="paired")
+        for actor in (ordinary, recorded):
+            torch.manual_seed(73)
+            actor.update_policy(sample_batch())
+        recorded.gradient_record_config.update(
+            enabled=True, baselines={"enabled": True, "seed": 23}, trajectory={"enabled": True}
+        )
+        for step in (1, 2):
+            batch = self.baseline_batch(step)
+            originals = {key: value.clone() for key, value in batch.batch.items()}
+            torch.manual_seed(100 + step)
+            expected_metrics = ordinary.update_policy(sample_batch(step))
+            expected_rng = torch.random.get_rng_state().clone()
+            torch.manual_seed(100 + step)
+            actual_metrics = recorded.update_policy(batch)
+            self.assert_training_state_equal(recorded, ordinary)
+            self.assertTrue(torch.equal(torch.random.get_rng_state(), expected_rng))
+            self.assertEqual(actual_metrics, expected_metrics)
+            for key, value in originals.items():
+                self.assertTrue(torch.equal(batch.batch[key], value), key)
+            self.assertTrue(all(parameter.grad is None for parameter in recorded.actor_module.parameters()))
+        self.assertEqual(recorded.optimization_trajectory.updates, 2)
+        self.assertEqual(len(list((self.root / "on").glob("trajectory_step_*.json"))), 2)
+        self.assertFalse((self.root / "off").exists())
+
+    def test_zero_supervised_gradient_has_undefined_baseline_directions(self):
+        actor = make_actor(True, self.root / "zero", mode="paired")
+        actor.gradient_record_config["baselines"] = {"enabled": True, "seed": 23}
+        batch = self.baseline_batch()
+        batch.batch["diagnostic_supervised_advantages"].zero_()
+        batch.batch["diagnostic_shuffled_advantages"].zero_()
+        torch.manual_seed(101)
+        actor.update_policy(batch)
+        result = json.loads(next((self.root / "zero").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "supervised_zero")
+        self.assertEqual(result["baselines"]["random_direction"]["status"], "supervised_zero")
+        self.assertEqual(result["baselines"]["shuffled_labels"]["status"], "both_zero")
+        for values in result["baselines"].values():
+            self.assertIsNone(values["cosine"])
+            self.assertIsNone(values["angle_deg"])
+
+    def test_enabled_baselines_require_shuffled_advantages_before_any_backward(self):
+        actor = make_actor(True, self.root / "missing_shuffle", mode="paired")
+        actor.gradient_record_config["baselines"] = {"enabled": True, "seed": 23}
+        with patch.object(actor, "_backward_micro_batches", wraps=actor._backward_micro_batches) as backward:
+            with self.assertRaisesRegex(ValueError, "shuffled advantages"):
+                actor.update_policy(paired_batch())
+        backward.assert_not_called()
+        self.assertFalse((self.root / "missing_shuffle").exists())
+
+    def test_disabled_baselines_keep_legacy_paired_records_and_need_no_shuffle_tensor(self):
+        actor = make_actor(True, self.root / "legacy", mode="paired")
+        actor.gradient_record_config["baselines"] = {"enabled": False, "seed": 23}
+        torch.manual_seed(101)
+        actor.update_policy(paired_batch())
+        result = json.loads(next((self.root / "legacy").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertNotIn("baselines", result)
+        self.assertNotIn("baseline_metadata", result)
 
 
 if __name__ == "__main__":
