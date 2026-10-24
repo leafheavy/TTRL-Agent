@@ -226,10 +226,22 @@ class TaskRunner:
         if run_data_preflight(config, train_dataset, val_dataset):
             return
 
+        two_stage = config.actor_rollout_ref.actor.get("gradient_record", {}).get("two_stage", {})
+        if two_stage.get("enabled", False):
+            from verl.utils.gradient_replay import prepare_replay_directory
+
+            # Capture the resolved configuration after the trainer has derived its
+            # training-step budget, and before any worker normalizes batch sizes.
+            prepare_replay_directory(two_stage["replay_dir"], OmegaConf.to_container(config, resolve=True))
+
         # Initialize the workers of the trainer.
         trainer.init_workers()
         # Start the training process.
         trainer.fit()
+        if two_stage.get("enabled", False):
+            # An interrupted run never receives completion markers, so phase two
+            # cannot silently consume only a prefix of the training trajectory.
+            trainer.actor_rollout_wg.complete_gradient_capture()
         trainer.serve_after_training()
 
 

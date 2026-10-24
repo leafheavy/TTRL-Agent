@@ -111,8 +111,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         Worker.__init__(self)
 
         self.config = config
-        import torch.distributed
         import datetime
+
+        import torch.distributed
 
         if not torch.distributed.is_initialized():
             rank = int(os.environ.get("RANK", 0))
@@ -667,6 +668,33 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=checkpoint_contents,
             )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def complete_gradient_capture(self):
+        """Publish a phase-one archive only after every training step succeeds."""
+        if not self._is_actor:
+            raise ValueError("Gradient capture completion requires an actor worker")
+        return self.actor.complete_gradient_capture()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def replay_gradient_diagnostics(self, directory, output_dir):
+        """Replay cached batches with one training model and no rollout engine."""
+        if not self._is_actor or self._is_rollout or self._is_ref:
+            raise ValueError("Gradient replay requires a standalone actor worker")
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+        try:
+            with self.ulysses_sharding_manager:
+                # The archive restores each minibatch's optimizer settings and
+                # RNG. Do not advance the online scheduler or resplit the data.
+                return self.actor.replay_gradient_diagnostics(directory, output_dir)
+        finally:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red")

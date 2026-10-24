@@ -245,6 +245,12 @@ actor_rollout_ref:
       trajectory:
         enabled: false
 
+      # Stage one records U-vs-S plus every rank's complete replay minibatches.
+      # Stage two uses trainer.replay_gradient and has no online TTRL/sampler.
+      two_stage:
+        enabled: false
+        replay_dir: ${trainer.default_local_dir}/gradient_replay
+
       # Derived from the run directory; paired needs trajectory or single_step enabled.
       # All ranks share this directory on multi-GPU jobs.
       output_dir: ${trainer.default_local_dir}/gradients

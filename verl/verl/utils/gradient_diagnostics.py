@@ -132,6 +132,24 @@ def validate_gradient_recording(config):
         selection = baselines.get(name, {})
         if not hasattr(selection, "get") or not isinstance(selection.get("enabled", True), bool):
             raise ValueError(f"gradient_record.baselines.{name}.enabled must be a boolean")
+    two_stage = record.get("two_stage", {})
+    if two_stage.get("enabled", False):
+        if not trajectory or mode != "paired" or actor.strategy != "fsdp":
+            raise ValueError("Two-stage capture requires paired FSDP1 optimization trajectories")
+        if baselines.get("enabled", False):
+            raise ValueError("Stage one requires gradient_record.baselines.enabled=False")
+        if record.get("single_step", {}).get("enabled", True):
+            raise ValueError("Two-stage capture requires single_step.enabled=False")
+        if not two_stage.get("replay_dir"):
+            raise ValueError("Two-stage capture requires two_stage.replay_dir")
+        if config.trainer.get("resume_mode", "auto") != "disable":
+            raise ValueError("Two-stage capture requires trainer.resume_mode=disable and a fresh archive")
+        if config.trainer.get("post_train_eval", {}).get("enabled", False):
+            raise ValueError("Two-stage capture requires trainer.post_train_eval.enabled=False")
+        if actor.get("use_dynamic_bsz", False):
+            raise ValueError("Two-stage capture currently requires use_dynamic_bsz=False")
+        if actor.fsdp_config.get("param_offload", False) or actor.fsdp_config.get("optimizer_offload", False):
+            raise ValueError("Two-stage capture currently requires actor parameter/optimizer offload disabled")
     if mode == "paired":
         ttrl = config.get("ttrl", {})
         if not ttrl.get("enable", False) or ttrl.get("reward_mode", "math") != "bfcl":
@@ -928,10 +946,20 @@ def compare_paired_run(directory, output):
 
 def _export_trajectories(directory, output):
     rows = []
+    replay_run_id = None
+    replay_records = 0
     for path in sorted(Path(directory).glob("trajectory_step_*_epoch_*_minibatch_*.json")):
         record = json.loads(path.read_text(encoding="utf-8"))
         if record.get("version") not in (1, 2) or record.get("mode") != "optimization_trajectory":
             raise ValueError(f"Unsupported optimization trajectory record: {path}")
+        if "two_stage" in record:
+            replay = record["two_stage"]
+            if not replay.get("verified") or not replay.get("run_id"):
+                raise ValueError("Cannot export an unverified two-stage comparison")
+            if replay_run_id is not None and replay_run_id != replay["run_id"]:
+                raise ValueError("Cannot mix replay results from different stage-one runs")
+            replay_run_id = replay["run_id"]
+            replay_records += 1
         keys = ("update", "step", "epoch", "minibatch", "updates", "start_update", "end_update")
         row = {key: record[key] for key in keys}
         for name in ("endpoint", "path"):
@@ -958,6 +986,18 @@ def _export_trajectories(directory, output):
         rows.append(row)
     if not rows:
         return None
+    if replay_records:
+        completion_path = Path(directory) / "complete.json"
+        if not completion_path.is_file():
+            raise ValueError("Two-stage replay is incomplete; complete.json is required before export")
+        completion = json.loads(completion_path.read_text(encoding="utf-8"))
+        ranks = completion.get("ranks", [])
+        world_size = completion.get("world_size", 0)
+        if (completion.get("stage") != 2 or completion.get("run_id") != replay_run_id
+                or replay_records != len(rows) or len(ranks) != world_size
+                or {item.get("rank") for item in ranks} != set(range(world_size))
+                or any(item.get("updates") != len(rows) for item in ranks)):
+            raise ValueError("Two-stage replay completion does not match the exported update sequence")
     destination = Path(output)
     destination.mkdir(parents=True, exist_ok=True)
     csv_path = destination / "trajectory_comparison.csv"

@@ -208,6 +208,19 @@ class TestPairedGradientTrainer(unittest.TestCase):
         self.assertNotIn("diagnostic_shuffled_advantages", batch.batch)
         self.assertNotIn("gradient_baselines", batch.meta_info)
 
+    def test_stage_one_prepares_replay_labels_without_an_online_baseline(self):
+        trainer, batch = self.trainer(baselines=False, trajectory=True, single_step=False), self.batch()
+        record = trainer.config.actor_rollout_ref.actor.gradient_record
+        record["two_stage"] = Config(enabled=True, replay_dir="unused")
+        original = {key: value.clone() for key, value in batch.batch.items()}
+        trainer._prepare_paired_gradient_advantages(batch)
+        self.assertIn("diagnostic_supervised_advantages", batch.batch)
+        self.assertIn("diagnostic_shuffled_advantages", batch.batch)
+        self.assertIn("gradient_baselines", batch.meta_info)
+        self.assertFalse(record.get("baselines", {}).get("enabled", False))
+        for name, value in original.items():
+            torch.testing.assert_close(batch.batch[name], value, rtol=0, atol=0)
+
     def test_individual_baseline_switches_only_prepare_requested_shuffled_labels(self):
         for shuffled_enabled, random_enabled in ((True, False), (False, True), (False, False)):
             with self.subTest(shuffled=shuffled_enabled, random=random_enabled):
@@ -218,7 +231,9 @@ class TestPairedGradientTrainer(unittest.TestCase):
                     random_direction=Config(enabled=random_enabled),
                 )
                 originals = {key: value.clone() for key, value in batch.batch.items()}
-                with patch.object(diagnostics, "shuffle_outcome_rewards", wraps=diagnostics.shuffle_outcome_rewards) as shuffle:
+                with patch.object(
+                    diagnostics, "shuffle_outcome_rewards", wraps=diagnostics.shuffle_outcome_rewards
+                ) as shuffle:
                     trainer._prepare_paired_gradient_advantages(batch)
                 self.assertEqual(shuffle.call_count, int(shuffled_enabled))
                 self.assertIn("diagnostic_supervised_advantages", batch.batch)

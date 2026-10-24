@@ -589,7 +589,7 @@ class DataParallelPPOActor(BasePPOActor):
             self.actor_optimizer.zero_grad()
             cache = None
 
-    def _advance_supervised_trajectory(self, micro_batches, temperature, devices):
+    def _advance_supervised_trajectory(self, micro_batches, temperature, devices, metadata=None):
         from verl.utils.gradient_diagnostics import OptimizationTrajectory, baseline_enabled
 
         baseline_config = self.gradient_record_config.get("baselines", {})
@@ -603,6 +603,28 @@ class DataParallelPPOActor(BasePPOActor):
                 shuffled_labels=shuffled_enabled,
                 random_direction=baseline_enabled(baseline_config, "random_direction"),
                 seed=baseline_config.get("seed", 0),
+            )
+
+        capture = self.gradient_record_config.get("two_stage", {})
+        if capture.get("enabled", False):
+            from verl.utils.gradient_replay import GradientReplayWriter, actor_objective_config
+
+            if baselines_enabled:
+                raise ValueError("Stage one must disable online baselines")
+            if metadata is None:
+                raise ValueError("Two-stage capture requires optimizer minibatch metadata")
+            if not hasattr(self, "gradient_replay_writer"):
+                self.gradient_replay_writer = GradientReplayWriter(
+                    capture["replay_dir"], torch.distributed.get_rank(), torch.distributed.get_world_size(),
+                    actor_objective_config(self.config),
+                )
+                self.gradient_replay_writer.start(
+                    self.optimization_trajectory, self.actor_module, self.actor_optimizer
+                )
+            self.gradient_replay_writer.begin(
+                micro_batches, metadata=metadata, temperature=temperature,
+                gradient_accumulation=self.gradient_accumulation, optimizer=self.actor_optimizer,
+                device_name=self.device_name,
             )
 
         def update(advantages_key="diagnostic_supervised_advantages"):
@@ -635,10 +657,96 @@ class DataParallelPPOActor(BasePPOActor):
             world_size=torch.distributed.get_world_size(),
             device=torch.device(self.device_name, devices[0]) if devices else None,
         )
+        if hasattr(self, "gradient_replay_writer"):
+            self.gradient_replay_writer.finish(self.optimization_trajectory, result)
         if recording_due(self.gradient_record_config, metadata["step"]) or metadata.get("final_step", False):
             save_trajectory_statistics(
                 result, self.gradient_record_config["output_dir"], rank=torch.distributed.get_rank()
             )
+
+    def complete_gradient_capture(self):
+        """Seal an archive only after the entire first-stage training run succeeds."""
+        if self.gradient_record_config.get("two_stage", {}).get("enabled", False):
+            if not hasattr(self, "gradient_replay_writer"):
+                raise ValueError("Stage one completed without capturing any optimizer updates")
+            self.gradient_replay_writer.complete()
+
+    def replay_gradient_diagnostics(self, directory, output_dir):
+        """Replay supervised versus shuffled labels without a TTRL policy or sampler."""
+        from verl.utils.gradient_diagnostics import OptimizationTrajectory, save_trajectory_statistics
+        from verl.utils.gradient_replay import GradientReplayReader, actor_objective_config, restore_rng
+
+        rank, world_size = torch.distributed.get_rank(), torch.distributed.get_world_size()
+        devices = [get_device_id()] if self.device_name != "cpu" else []
+        device = torch.device(self.device_name, devices[0]) if devices else None
+
+        def check_error(error):
+            mismatch = torch.tensor(int(error is not None), device=device, dtype=torch.int32)
+            if world_size > 1:
+                torch.distributed.all_reduce(mismatch, op=torch.distributed.ReduceOp.MAX)
+            if mismatch.item():
+                raise ValueError(error or "Gradient replay failed validation or output on another rank")
+
+        setup_error = None
+        try:
+            reader = GradientReplayReader(directory, rank, world_size)
+            reader.validate_actor_config(actor_objective_config(self.config))
+            reader.restore_initial(self.actor_module, self.actor_optimizer)
+        except Exception as exc:
+            setup_error = str(exc)
+        check_error(setup_error)
+        self.actor_module.train()
+        trajectory = OptimizationTrajectory(self.actor_module, self.actor_optimizer, baselines=False)
+        updates = 0
+        frames = iter(reader.frames())
+        for _ in range(len(reader.manifest["frames"])):
+            frame_error = None
+            try:
+                frame = next(frames)
+                reader.restore_frame(frame, self.actor_module, self.actor_optimizer, self.device_name)
+            except Exception as exc:
+                frame_error = str(exc)
+            check_error(frame_error)
+            self.gradient_accumulation = frame["gradient_accumulation"]
+            micro_batches = frame["micro_batches"]
+            temperature = frame["temperature"]
+
+            def update(advantages_key, micro_batches=micro_batches, temperature=temperature):
+                self._backward_micro_batches(micro_batches, temperature, {}, advantages_key=advantages_key)
+                self._optimizer_step()
+
+            trajectory.supervised_step(
+                self.actor_module, self.actor_optimizer,
+                lambda: update("diagnostic_supervised_advantages"),
+                rank=rank, world_size=world_size, device=device,
+            )
+            # Every rank checks the entire supervised state, including Adam
+            # history. Fail together before another FSDP forward if any diverges.
+            verification_error = None
+            try:
+                reader.verify_reference(frame, trajectory)
+            except Exception as exc:
+                verification_error = str(exc)
+            check_error(verification_error)
+
+            # Both branches start at the same captured random point, including
+            # Python/NumPy RNG in addition to Torch's forked model RNG.
+            restore_rng(frame["rng"], self.device_name)
+            self.actor_optimizer.zero_grad()
+            update("diagnostic_shuffled_advantages")
+            baseline_result = trajectory.finish_step(
+                self.actor_module, frame["metadata"], rank=rank, world_size=world_size, device=device
+            )
+            output_error = None
+            try:
+                result = reader.combine(frame, baseline_result)
+                save_trajectory_statistics(result, output_dir, rank=rank)
+            except Exception as exc:
+                output_error = str(exc)
+            check_error(output_error)
+            updates += 1
+        self.actor_optimizer.zero_grad()
+        return {"rank": rank, "updates": updates, "output_dir": str(output_dir)}
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -682,7 +790,8 @@ class DataParallelPPOActor(BasePPOActor):
             if "diagnostic_supervised_advantages" not in data.batch:
                 raise ValueError("Paired policy gradients require trainer-provided supervised advantages")
             select_keys.append("diagnostic_supervised_advantages")
-            if baseline_enabled(self.gradient_record_config.get("baselines", {}), "shuffled_labels"):
+            if (baseline_enabled(self.gradient_record_config.get("baselines", {}), "shuffled_labels")
+                    or self.gradient_record_config.get("two_stage", {}).get("enabled", False)):
                 if "diagnostic_shuffled_advantages" not in data.batch:
                     raise ValueError("Paired baselines require trainer-provided shuffled advantages")
                 select_keys.append("diagnostic_shuffled_advantages")
@@ -745,7 +854,13 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                 if record_trajectory:
                     devices = [get_device_id()] if self.device_name != "cpu" else []
-                    self._advance_supervised_trajectory(micro_batches, temperature, devices)
+                    if self.gradient_record_config.get("two_stage", {}).get("enabled", False):
+                        self._advance_supervised_trajectory(
+                            micro_batches, temperature, devices,
+                            metadata={**gradient_metadata, "epoch": epoch, "minibatch": batch_idx},
+                        )
+                    else:
+                        self._advance_supervised_trajectory(micro_batches, temperature, devices)
                 self.actor_optimizer.zero_grad()
                 self._backward_micro_batches(micro_batches, temperature, metrics)
 

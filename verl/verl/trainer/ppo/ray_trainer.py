@@ -1380,7 +1380,9 @@ class RayPPOTrainer:
         baselines = record.get("baselines", {})
         from verl.utils.gradient_diagnostics import baseline_enabled
 
-        if baseline_enabled(baselines, "shuffled_labels"):
+        # Stage one caches the exact shuffled advantages without constructing
+        # or advancing a shuffled-label model/optimizer branch.
+        if baseline_enabled(baselines, "shuffled_labels") or record.get("two_stage", {}).get("enabled", False):
             from verl.utils.gradient_diagnostics import diagnostic_seed, shuffle_outcome_rewards
 
             shuffled_rewards, metadata = shuffle_outcome_rewards(
