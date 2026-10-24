@@ -231,6 +231,12 @@ actor_rollout_ref:
       baselines:
         enabled: true
         seed: 0
+        # Independent switches; omitted fields keep both legacy baselines enabled.
+        shuffled_labels:
+          enabled: true
+        # Same-point random gradients and the trajectory's random_update path.
+        random_direction:
+          enabled: true
 
       # Independent supervised and optional shuffled-label optimizer branches.
       # Gaussian update paths match each real TTRL step's global L2 norm.

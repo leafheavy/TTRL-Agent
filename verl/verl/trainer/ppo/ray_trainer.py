@@ -1378,7 +1378,9 @@ class RayPPOTrainer:
         )
         batch.batch["diagnostic_supervised_advantages"] = advantages
         baselines = record.get("baselines", {})
-        if baselines.get("enabled", False):
+        from verl.utils.gradient_diagnostics import baseline_enabled
+
+        if baseline_enabled(baselines, "shuffled_labels"):
             from verl.utils.gradient_diagnostics import diagnostic_seed, shuffle_outcome_rewards
 
             shuffled_rewards, metadata = shuffle_outcome_rewards(

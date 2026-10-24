@@ -471,6 +471,86 @@ class TestTrajectoryRandomBaselines(unittest.TestCase):
             else:
                 self.assertEqual(actual[key], value)
 
+    def test_baseline_selection_preserves_legacy_defaults_and_master_switch(self):
+        for enabled, shuffled, random in (
+            (False, True, True), (True, True, True), (True, True, False),
+            (True, False, True), (True, False, False),
+        ):
+            with self.subTest(enabled=enabled, shuffled=shuffled, random=random):
+                config = {
+                    "enabled": enabled,
+                    "shuffled_labels": {"enabled": shuffled},
+                    "random_direction": {"enabled": random},
+                }
+                self.assertEqual(diagnostics.baseline_enabled(config, "shuffled_labels"), enabled and shuffled)
+                self.assertEqual(diagnostics.baseline_enabled(config, "random_direction"), enabled and random)
+        self.assertTrue(diagnostics.baseline_enabled({"enabled": True}, "shuffled_labels"))
+        self.assertTrue(diagnostics.baseline_enabled({"enabled": True}, "random_direction"))
+        self.assertFalse(diagnostics.baseline_enabled({}, "shuffled_labels"))
+
+    def test_shuffled_only_matches_full_baseline_path_without_allocating_random_displacement(self):
+        torch.manual_seed(31)
+        original = nn.Linear(2, 1, dtype=torch.float64)
+        original.register_buffer("num_forwards", torch.zeros((), dtype=torch.long))
+        original_optimizer = self.optimizer(original)
+        self.update(original, original_optimizer, torch.zeros(3, 1, dtype=torch.float64))
+        branches = []
+        for random_enabled in (True, False):
+            module = copy.deepcopy(original)
+            optimizer = self.optimizer(module)
+            optimizer.load_state_dict(copy.deepcopy(original_optimizer.state_dict()))
+            trajectory = diagnostics.OptimizationTrajectory(
+                module, optimizer, baselines=True, random_direction=random_enabled, seed=17
+            )
+            branches.append((module, optimizer, trajectory))
+        shuffled_only = branches[1][2]
+        self.assertTrue(shuffled_only.shuffled_labels_enabled)
+        self.assertFalse(shuffled_only.random_direction_enabled)
+        self.assertFalse(hasattr(shuffled_only, "random_displacement"))
+        with patch.object(shuffled_only, "_random_chunks", side_effect=AssertionError("random baseline ran")):
+            for step in (1, 2):
+                records = []
+                for module, optimizer, trajectory in branches:
+                    trajectory.supervised_step(
+                        module, optimizer,
+                        lambda: self.update(module, optimizer, torch.ones(3, 1, dtype=torch.float64)),
+                        shuffled_callback=lambda: self.update(
+                            module, optimizer, -torch.ones(3, 1, dtype=torch.float64)
+                        ),
+                    )
+                    self.update(module, optimizer, torch.full((3, 1), 0.3, dtype=torch.float64))
+                    records.append(trajectory.finish_step(module, {**metadata(), "step": step}))
+                self.assertEqual(set(records[1]["baselines"]), {"shuffled_labels"})
+                self.assertEqual(records[0]["baselines"]["shuffled_labels"], records[1]["baselines"]["shuffled_labels"])
+                for comparison in ("endpoint", "path"):
+                    self.assertEqual(records[0][comparison], records[1][comparison])
+                self.assert_state_equal(branches[0][0].state_dict(), branches[1][0].state_dict())
+                self.assert_state_equal(branches[0][1].state_dict(), branches[1][1].state_dict())
+                self.assert_state_equal(branches[0][2].shuffled_parameters, shuffled_only.shuffled_parameters)
+                self.assert_state_equal(
+                    list(diagnostics._restore_state(branches[0][2].shuffled_optimizer_state).values()),
+                    list(diagnostics._restore_state(shuffled_only.shuffled_optimizer_state).values()),
+                )
+
+    def test_random_only_requires_no_shuffled_optimizer_branch_or_callback(self):
+        module = nn.Linear(2, 1, dtype=torch.float64)
+        module.register_buffer("num_forwards", torch.zeros((), dtype=torch.long))
+        optimizer = self.optimizer(module)
+        trajectory = diagnostics.OptimizationTrajectory(
+            module, optimizer, baselines=True, shuffled_labels=False, seed=17
+        )
+        self.assertFalse(trajectory.shuffled_labels_enabled)
+        self.assertTrue(trajectory.random_direction_enabled)
+        for name in ("shuffled_parameters", "shuffled_buffers", "shuffled_optimizer_state"):
+            self.assertFalse(hasattr(trajectory, name), name)
+        trajectory.supervised_step(
+            module, optimizer, lambda: self.update(module, optimizer, torch.ones(3, 1, dtype=torch.float64))
+        )
+        self.update(module, optimizer, torch.zeros(3, 1, dtype=torch.float64))
+        record = trajectory.finish_step(module, metadata())
+        self.assertEqual(set(record["baselines"]), {"random_update"})
+        self.assertGreater(record["baselines"]["random_update"]["target_step_norm"], 0)
+
     def test_three_optimizer_paths_match_adamw_oracles_and_random_actual_increments(self):
         torch.manual_seed(31)
         module = nn.Sequential(nn.Linear(2, 3, dtype=torch.float64), nn.Dropout(0.35),

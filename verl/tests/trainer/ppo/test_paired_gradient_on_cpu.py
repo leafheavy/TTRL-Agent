@@ -208,6 +208,25 @@ class TestPairedGradientTrainer(unittest.TestCase):
         self.assertNotIn("diagnostic_shuffled_advantages", batch.batch)
         self.assertNotIn("gradient_baselines", batch.meta_info)
 
+    def test_individual_baseline_switches_only_prepare_requested_shuffled_labels(self):
+        for shuffled_enabled, random_enabled in ((True, False), (False, True), (False, False)):
+            with self.subTest(shuffled=shuffled_enabled, random=random_enabled):
+                trainer, batch = self.trainer(baselines=True, trajectory=True, single_step=False), self.batch()
+                baseline_config = trainer.config.actor_rollout_ref.actor.gradient_record["baselines"]
+                baseline_config.update(
+                    shuffled_labels=Config(enabled=shuffled_enabled),
+                    random_direction=Config(enabled=random_enabled),
+                )
+                originals = {key: value.clone() for key, value in batch.batch.items()}
+                with patch.object(diagnostics, "shuffle_outcome_rewards", wraps=diagnostics.shuffle_outcome_rewards) as shuffle:
+                    trainer._prepare_paired_gradient_advantages(batch)
+                self.assertEqual(shuffle.call_count, int(shuffled_enabled))
+                self.assertIn("diagnostic_supervised_advantages", batch.batch)
+                self.assertEqual("diagnostic_shuffled_advantages" in batch.batch, shuffled_enabled)
+                self.assertEqual("gradient_baselines" in batch.meta_info, shuffled_enabled)
+                for name, original in originals.items():
+                    torch.testing.assert_close(batch.batch[name], original, rtol=0, atol=0)
+
     def test_disabled_full_skipped_and_warmup_do_not_use_oracle(self):
         cases = (
             {"enabled": False},

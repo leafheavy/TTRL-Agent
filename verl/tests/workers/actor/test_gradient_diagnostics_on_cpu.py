@@ -801,6 +801,37 @@ class TestPairedRandomBaselines(unittest.TestCase):
         backward.assert_not_called()
         self.assertFalse((self.root / "missing_shuffle").exists())
 
+    def test_single_baseline_selection_preserves_training_and_skips_disabled_computation(self):
+        for shuffled_enabled, random_enabled in ((True, False), (False, True)):
+            with self.subTest(shuffled=shuffled_enabled, random=random_enabled):
+                directory = self.root / f"single_{shuffled_enabled}_{random_enabled}"
+                ordinary = make_actor(False, self.root / "ordinary")
+                recorded = make_actor(True, directory, mode="paired")
+                recorded.gradient_record_config.update(
+                    single_step={"enabled": True},
+                    baselines={
+                        "enabled": True, "seed": 23,
+                        "shuffled_labels": {"enabled": shuffled_enabled},
+                        "random_direction": {"enabled": random_enabled},
+                    },
+                )
+                batch = self.baseline_batch() if shuffled_enabled else paired_batch()
+                torch.manual_seed(101)
+                expected_metrics = ordinary.update_policy(sample_batch())
+                expected_rng = torch.random.get_rng_state().clone()
+                torch.manual_seed(101)
+                with patch.object(diagnostics, "random_gradient_statistics", wraps=diagnostics.random_gradient_statistics) as random:
+                    with patch.object(recorded, "_backward_micro_batches", wraps=recorded._backward_micro_batches) as backward:
+                        actual_metrics = recorded.update_policy(batch)
+                self.assertEqual(random.call_count, int(random_enabled))
+                self.assertEqual(backward.call_count, 3 + int(shuffled_enabled))
+                self.assertEqual(actual_metrics, expected_metrics)
+                self.assert_training_state_equal(recorded, ordinary)
+                self.assertTrue(torch.equal(torch.random.get_rng_state(), expected_rng))
+                record = json.loads(next(directory.glob("*.json")).read_text(encoding="utf-8"))
+                expected = {"shuffled_labels"} if shuffled_enabled else {"random_direction"}
+                self.assertEqual(set(record["baselines"]), expected)
+
     def test_disabled_baselines_keep_legacy_paired_records_and_need_no_shuffle_tensor(self):
         actor = make_actor(True, self.root / "legacy", mode="paired")
         actor.gradient_record_config["baselines"] = {"enabled": False, "seed": 23}
@@ -924,6 +955,32 @@ class TestTrajectoryBaselineWiring(unittest.TestCase):
         record = json.loads(path.read_text(encoding="utf-8"))
         self.assertFalse(record.get("baselines"))
         self.assertFalse(list((self.root / "supervised_only").glob("step_*.json")))
+
+    def test_single_trajectory_baseline_switches_propagate_to_state_and_backward_passes(self):
+        for shuffled_enabled, random_enabled in ((True, False), (False, True)):
+            with self.subTest(shuffled=shuffled_enabled, random=random_enabled):
+                directory = self.root / f"trajectory_{shuffled_enabled}_{random_enabled}"
+                actor = make_actor(True, directory, mode="paired")
+                actor.gradient_record_config.update(
+                    single_step={"enabled": False}, trajectory={"enabled": True},
+                    baselines={
+                        "enabled": True, "seed": 23,
+                        "shuffled_labels": {"enabled": shuffled_enabled},
+                        "random_direction": {"enabled": random_enabled},
+                    },
+                )
+                batch = TestPairedRandomBaselines.baseline_batch() if shuffled_enabled else paired_batch()
+                with patch.object(actor, "_backward_micro_batches", wraps=actor._backward_micro_batches) as backward:
+                    actor.update_policy(batch)
+                self.assertEqual(backward.call_count, 2 + int(shuffled_enabled))
+                trajectory = actor.optimization_trajectory
+                self.assertEqual(trajectory.shuffled_labels_enabled, shuffled_enabled)
+                self.assertEqual(trajectory.random_direction_enabled, random_enabled)
+                self.assertEqual(hasattr(trajectory, "random_displacement"), random_enabled)
+                self.assertEqual(hasattr(trajectory, "shuffled_optimizer_state"), shuffled_enabled)
+                record = json.loads(next(directory.glob("trajectory_step_*.json")).read_text(encoding="utf-8"))
+                expected = {"shuffled_labels"} if shuffled_enabled else {"random_update"}
+                self.assertEqual(set(record["baselines"]), expected)
 
 
 if __name__ == "__main__":

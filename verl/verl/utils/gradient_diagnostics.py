@@ -100,6 +100,11 @@ def paired_recording_due(config, step):
     )
 
 
+def baseline_enabled(config, name):
+    """Select one baseline, keeping legacy master-only configurations enabled."""
+    return bool(config.get("enabled", False) and config.get(name, {}).get("enabled", True))
+
+
 def validate_gradient_recording(config):
     """Fail early instead of silently recording a regularized or unsupported loss."""
     actor = config.actor_rollout_ref.actor
@@ -119,9 +124,14 @@ def validate_gradient_recording(config):
         raise ValueError("Optimization trajectory diagnostics require mode=paired and strategy=fsdp (FSDP1)")
     if mode == "paired" and not trajectory and not record.get("single_step", {}).get("enabled", True):
         raise ValueError("Paired diagnostics require trajectory.enabled=True or single_step.enabled=True")
-    seed = record.get("baselines", {}).get("seed", 0)
+    baselines = record.get("baselines", {})
+    seed = baselines.get("seed", 0)
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError("gradient_record.baselines.seed must be a non-negative integer")
+    for name in ("shuffled_labels", "random_direction"):
+        selection = baselines.get(name, {})
+        if not hasattr(selection, "get") or not isinstance(selection.get("enabled", True), bool):
+            raise ValueError(f"gradient_record.baselines.{name}.enabled must be a boolean")
     if mode == "paired":
         ttrl = config.get("ttrl", {})
         if not ttrl.get("enable", False) or ttrl.get("reward_mode", "math") != "bfcl":
@@ -442,11 +452,15 @@ class OptimizationTrajectory:
     FSDP1 local shards suffice; no model or update vector is gathered.
     """
 
-    def __init__(self, module, optimizer, *, baselines=False, seed=0):
+    def __init__(
+        self, module, optimizer, *, baselines=False, seed=0, shuffled_labels=True, random_direction=True
+    ):
         diagnostic_seed(seed)
         if seed < 0:
             raise ValueError("Optimization trajectory seed must be non-negative")
-        self.baselines = bool(baselines)
+        self.shuffled_labels_enabled = bool(baselines and shuffled_labels)
+        self.random_direction_enabled = bool(baselines and random_direction)
+        self.baselines = self.shuffled_labels_enabled or self.random_direction_enabled
         self.seed = int(seed)
         self.layouts = [_parameter_layout(name, parameter) for name, parameter in module.named_parameters()
                         if parameter.requires_grad]
@@ -459,17 +473,21 @@ class OptimizationTrajectory:
         self.updates = 0
         self.path_statistics = torch.zeros(3, dtype=torch.float64)
         self.start_update = None
-        if self.baselines:
+        if self.shuffled_labels_enabled:
             # Initial values are immutable CPU snapshots, shared by reference.
             # Each branch receives its own values only after its first update.
             self.shuffled_parameters = self.initial_parameters
             self.shuffled_buffers = self.supervised_buffers
             self.shuffled_optimizer_state = self.supervised_optimizer_state
+        if self.random_direction_enabled:
             self.random_displacement = [torch.zeros_like(value, dtype=torch.float32)
                                         for value in self.initial_parameters]
-            self.baseline_path_statistics = {
-                name: torch.zeros(3, dtype=torch.float64) for name in ("shuffled_labels", "random_update")
-            }
+        self.baseline_path_statistics = {
+            name: torch.zeros(3, dtype=torch.float64)
+            for name, enabled in (("shuffled_labels", self.shuffled_labels_enabled),
+                                  ("random_update", self.random_direction_enabled))
+            if enabled
+        }
 
     def _parameters(self, module):
         parameters = [(name, p) for name, p in module.named_parameters() if p.requires_grad]
@@ -517,17 +535,17 @@ class OptimizationTrajectory:
         """
         if self.pending is not None:
             raise ValueError("The preceding real optimizer step has not been recorded")
-        if self.baselines != (shuffled_callback is not None):
-            raise ValueError("Trajectory baselines require exactly one shuffled-label update callback")
+        if self.shuffled_labels_enabled != (shuffled_callback is not None):
+            raise ValueError("The shuffled-label baseline requires exactly one shuffled-label update callback")
         live_parameters = self._parameters(module)
         live_buffers = self._buffers(module)
         live_state = _snapshot_state(optimizer.state)
         groups = [{key: copy.deepcopy(value) for key, value in group.items() if key != "params"}
                   for group in optimizer.param_groups]
         previous_supervised = self.supervised_parameters
-        previous_shuffled = self.shuffled_parameters if self.baselines else None
+        previous_shuffled = self.shuffled_parameters if self.shuffled_labels_enabled else None
         branches = [(callback, self.supervised_parameters, self.supervised_buffers, self.supervised_optimizer_state)]
-        if self.baselines:
+        if self.shuffled_labels_enabled:
             branches.append((shuffled_callback, self.shuffled_parameters,
                              self.shuffled_buffers, self.shuffled_optimizer_state))
         updated = []
@@ -551,7 +569,7 @@ class OptimizationTrajectory:
             optimizer.state = _restore_state(live_state)
             self._restore_groups(optimizer, groups)
         self.supervised_parameters, self.supervised_buffers, self.supervised_optimizer_state = updated[0]
-        if self.baselines:
+        if self.shuffled_labels_enabled:
             self.shuffled_parameters, self.shuffled_buffers, self.shuffled_optimizer_state = updated[1]
         self.pending = (live_parameters, previous_supervised, previous_shuffled)
 
@@ -596,7 +614,7 @@ class OptimizationTrajectory:
                 dy = current.double() - previous_u[start:stop].double()
                 self._add_statistics(endpoint, x, y)
                 self._add_statistics(increment, dx, dy)
-                if self.baselines:
+                if self.shuffled_labels_enabled:
                     shuffled = self.shuffled_parameters[index].reshape(-1)[start:stop].double()
                     previous = shuffled_before[index].reshape(-1)[start:stop].double()
                     self._add_statistics(baseline_endpoints["shuffled_labels"], x,
@@ -606,7 +624,7 @@ class OptimizationTrajectory:
             raise ValueError("Non-finite optimization trajectory statistics")
         key = f"step_{metadata['step']:06d}_epoch_{metadata['epoch']:03d}_minibatch_{metadata['minibatch']:04d}"
         random_norms = None
-        if self.baselines:
+        if self.random_direction_enabled:
             # The first collective defines a single full-coordinate scale.
             # Per-rank normalization would bias the global random direction.
             norms = torch.zeros(2, dtype=torch.float64)
@@ -644,7 +662,7 @@ class OptimizationTrajectory:
         for name in baseline_endpoints:
             self.baseline_path_statistics[name] += baseline_increments[name]
             pieces.extend((baseline_endpoints[name], self.baseline_path_statistics[name]))
-        if self.baselines:
+        if self.random_direction_enabled:
             pieces.append(random_norms[1].reshape(1))
         values = torch.cat(pieces)
         if not torch.isfinite(values).all():
@@ -683,9 +701,11 @@ class OptimizationTrajectory:
                     "endpoint": _comparison_statistics(*values[offset:offset + 3]),
                     "path": _comparison_statistics(*values[offset + 3:offset + 6]),
                 }
+        if self.shuffled_labels_enabled:
+            result["baselines"]["shuffled_labels"]["update_rule"] = "independent_training_optimizer_and_history"
+        if self.random_direction_enabled:
             target = math.sqrt(random_norms[0])
             applied = math.sqrt(values[-1])
-            result["baselines"]["shuffled_labels"]["update_rule"] = "independent_training_optimizer_and_history"
             result["baselines"]["random_update"].update({
                 "update_rule": "isotropic_gaussian_displacement_without_optimizer",
                 "step_norm_target": "ttrl_actual_global_step_l2_before_float32_accumulation_rounding",
@@ -696,12 +716,17 @@ class OptimizationTrajectory:
                 "path_increment": "actual_difference_of_float32_cumulative_displacement",
                 "rounding": "float32_accumulation_can_change_step_norm_especially_for_tiny_updates",
             })
+        if self.baselines:
             result["baseline_metadata"] = {
-                "seed": self.seed, "draws_per_update": 1,
+                "seed": self.seed,
                 "reference": "same_independent_supervised_optimizer_trajectory",
-                "random_coordinates": "all_trainable_coordinates_with_global_norm_and_rank_separated_cpu_rng",
                 "statistics_accumulation_dtype": "float64",
             }
+            if self.random_direction_enabled:
+                result["baseline_metadata"].update({
+                    "draws_per_update": 1,
+                    "random_coordinates": "all_trainable_coordinates_with_global_norm_and_rank_separated_cpu_rng",
+                })
         return result
 
 

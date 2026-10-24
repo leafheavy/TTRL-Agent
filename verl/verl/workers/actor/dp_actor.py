@@ -520,6 +520,7 @@ class DataParallelPPOActor(BasePPOActor):
     def _record_paired_policy_gradient(self, micro_batches, tensors, temperature, metadata, devices):
         """Compare both rewards at identical parameters without storing gradient files."""
         from verl.utils.gradient_diagnostics import (
+            baseline_enabled,
             capture_policy_gradient,
             diagnostic_seed,
             paired_gradient_statistics,
@@ -549,10 +550,11 @@ class DataParallelPPOActor(BasePPOActor):
                     advantages_key="diagnostic_supervised_advantages",
                 )
                 cache = capture_policy_gradient(self.actor_module)
-            if baseline_config.get("enabled", False):
+            if baseline_enabled(baseline_config, "random_direction"):
                 baselines["random_direction"] = random_gradient_statistics(
                     cache, seed=baseline_seed, rank=torch.distributed.get_rank()
                 )
+            if baseline_enabled(baseline_config, "shuffled_labels"):
                 with torch.random.fork_rng(devices=devices, device_type=self.device_name):
                     self.actor_optimizer.zero_grad()
                     self._backward_micro_batches(
@@ -576,9 +578,11 @@ class DataParallelPPOActor(BasePPOActor):
                     baselines=baselines,
                     baseline_metadata={
                         "seed": baseline_seed,
-                        "random_direction": "independent_isotropic_gaussian_global_unit_l2",
-                        "draws_per_update": 1,
-                        "shuffled_labels": metadata.get("shuffled_labels", {}),
+                        **({"random_direction": "independent_isotropic_gaussian_global_unit_l2",
+                            "draws_per_update": 1}
+                           if "random_direction" in baselines else {}),
+                        **({"shuffled_labels": metadata.get("shuffled_labels", {})}
+                           if "shuffled_labels" in baselines else {}),
                     },
                 )
         finally:
@@ -586,15 +590,18 @@ class DataParallelPPOActor(BasePPOActor):
             cache = None
 
     def _advance_supervised_trajectory(self, micro_batches, temperature, devices):
-        from verl.utils.gradient_diagnostics import OptimizationTrajectory
+        from verl.utils.gradient_diagnostics import OptimizationTrajectory, baseline_enabled
 
         baseline_config = self.gradient_record_config.get("baselines", {})
         baselines_enabled = baseline_config.get("enabled", False)
+        shuffled_enabled = baseline_enabled(baseline_config, "shuffled_labels")
         if not hasattr(self, "optimization_trajectory"):
             self.optimization_trajectory = OptimizationTrajectory(
                 self.actor_module,
                 self.actor_optimizer,
                 baselines=baselines_enabled,
+                shuffled_labels=shuffled_enabled,
+                random_direction=baseline_enabled(baseline_config, "random_direction"),
                 seed=baseline_config.get("seed", 0),
             )
 
@@ -609,7 +616,7 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_module,
                 self.actor_optimizer,
                 update,
-                shuffled_callback=(lambda: update("diagnostic_shuffled_advantages")) if baselines_enabled else None,
+                shuffled_callback=(lambda: update("diagnostic_shuffled_advantages")) if shuffled_enabled else None,
                 rank=torch.distributed.get_rank(),
                 world_size=torch.distributed.get_world_size(),
                 device=torch.device(self.device_name, devices[0]) if devices else None,
@@ -670,10 +677,12 @@ class DataParallelPPOActor(BasePPOActor):
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         if (record_gradient or record_trajectory) and self.gradient_record_config.get("mode", "full") == "paired":
+            from verl.utils.gradient_diagnostics import baseline_enabled
+
             if "diagnostic_supervised_advantages" not in data.batch:
                 raise ValueError("Paired policy gradients require trainer-provided supervised advantages")
             select_keys.append("diagnostic_supervised_advantages")
-            if self.gradient_record_config.get("baselines", {}).get("enabled", False):
+            if baseline_enabled(self.gradient_record_config.get("baselines", {}), "shuffled_labels"):
                 if "diagnostic_shuffled_advantages" not in data.batch:
                     raise ValueError("Paired baselines require trainer-provided shuffled advantages")
                 select_keys.append("diagnostic_shuffled_advantages")
