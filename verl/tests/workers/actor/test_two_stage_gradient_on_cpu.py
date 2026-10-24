@@ -83,11 +83,17 @@ class TestTwoStageGradientReplay(unittest.TestCase):
         )
         return actor
 
-    def prepare(self, directory=None):
+    def prepare(self, directory=None, *, initial_state="snapshot", max_archive_gb=None):
         directory = directory or self.root / "archive"
-        self.replay.prepare_replay_directory(
-            directory, {"trainer": {"n_gpus_per_node": 1, "nnodes": 1}}
-        )
+        config = {"trainer": {"n_gpus_per_node": 1, "nnodes": 1}}
+        selection = {}
+        if initial_state is not None:
+            selection["initial_state"] = initial_state
+        if max_archive_gb is not None:
+            selection["max_archive_gb"] = max_archive_gb
+        if selection:
+            config["actor_rollout_ref"] = {"actor": {"gradient_record": {"two_stage": selection}}}
+        self.replay.prepare_replay_directory(directory, config)
         return directory
 
     def capture(self, *, complete=True, minibatches=False):
@@ -209,6 +215,113 @@ class TestTwoStageGradientReplay(unittest.TestCase):
         self.assertEqual(len(rows), 12)
         self.assertIn("shuffled_labels_path_cosine", rows[0])
         self.assertNotIn("random_update_path_cosine", rows[0])
+
+    def test_pretrained_origin_uses_metadata_only_and_matches_online_paths(self):
+        self.prepare(initial_state="pretrained", max_archive_gb=4.0)
+        online = self.actor("pretrained_online", online=True)
+        capture = self.actor("pretrained_capture", capture=True)
+        for actor in (online, capture):
+            actor.actor_module.register_buffer("reference_counter", torch.zeros((), dtype=torch.long))
+        for step, learning_rate in ((1, 0.003), (2, 0.008), (3, 0.005)):
+            for actor in (online, capture):
+                actor.actor_optimizer.param_groups[0]["lr"] = learning_rate
+                batch = helpers.TestPairedRandomBaselines.baseline_batch(step)
+                batch.meta_info["gradient_record"]["final_step"] = step == 3
+                torch.manual_seed(310 + step)
+                actor.update_policy(batch)
+            self.assert_state_equal(capture.actor_module.state_dict(), online.actor_module.state_dict())
+            self.assert_state_equal(capture.actor_optimizer.state_dict(), online.actor_optimizer.state_dict())
+        capture.complete_gradient_capture()
+
+        rank_directory = self.root / "archive" / "rank_00000"
+        self.assertFalse((rank_directory / "initial.pt").exists())
+        manifest = json.loads((rank_directory / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["initial_file"], "initial_metadata.pt")
+        initial = torch.load(rank_directory / manifest["initial_file"], map_location="cpu", weights_only=True)
+        for name in ("parameters", "buffers", "optimizer_state"):
+            self.assertNotIn(name, initial)
+
+        def assert_no_saved_tensor(value):
+            self.assertNotIsInstance(value, torch.Tensor)
+            if isinstance(value, dict):
+                for item in value.values():
+                    assert_no_saved_tensor(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    assert_no_saved_tensor(item)
+
+        assert_no_saved_tensor(initial)
+        self.assertLess((rank_directory / manifest["initial_file"]).stat().st_size, 100_000)
+
+        baseline = self.actor("pretrained_replay")
+        baseline.actor_module.register_buffer("reference_counter", torch.zeros((), dtype=torch.long))
+        output = self.root / "pretrained_stage_two"
+        baseline.replay_gradient_diagnostics(self.root / "archive", output)
+        self.assertEqual(len(list(output.glob("trajectory_*.json"))), 3)
+        for path in output.glob("trajectory_*.json"):
+            actual = json.loads(path.read_text(encoding="utf-8"))
+            expected = json.loads((self.root / "pretrained_online" / path.name).read_text(encoding="utf-8"))
+            for comparison in ("endpoint", "path"):
+                self.assertEqual(actual[comparison], expected[comparison])
+                self.assertEqual(
+                    actual["baselines"]["shuffled_labels"][comparison],
+                    expected["baselines"]["shuffled_labels"][comparison],
+                )
+
+    def test_pretrained_origin_rejects_different_weights_or_buffers(self):
+        self.prepare(initial_state="pretrained")
+        capture = self.actor("pretrained_capture", capture=True)
+        capture.actor_module.register_buffer("reference_counter", torch.zeros((), dtype=torch.long))
+        capture.update_policy(helpers.TestPairedRandomBaselines.baseline_batch())
+        capture.complete_gradient_capture()
+        for change in ("weights", "buffers"):
+            with self.subTest(change=change):
+                actor = self.actor("pretrained_wrong_" + change)
+                actor.actor_module.register_buffer("reference_counter", torch.zeros((), dtype=torch.long))
+                with torch.no_grad():
+                    if change == "weights":
+                        next(actor.actor_module.parameters()).add_(0.5)
+                    else:
+                        actor.actor_module.reference_counter.add_(1)
+                original = copy.deepcopy(actor.actor_module.state_dict())
+                with self.assertRaisesRegex(ValueError, "[Pp]retrained|fingerprint|buffer|origin|initial"):
+                    self.reader().restore_initial(actor.actor_module, actor.actor_optimizer)
+                # Validation cannot silently overwrite a different checkpoint.
+                self.assert_state_equal(actor.actor_module.state_dict(), original)
+
+    def test_pretrained_origin_rejects_existing_adam_moments_without_snapshot_fallback(self):
+        self.prepare(initial_state="pretrained")
+        actor = self.actor("pretrained_nonempty_adam", capture=True)
+        actor.gradient_record_config["enabled"] = False
+        actor.update_policy(helpers.sample_batch())
+        self.assertTrue(actor.actor_optimizer.state)
+        actor.gradient_record_config["enabled"] = True
+        with self.assertRaisesRegex(ValueError, "[Pp]retrained|[Aa]dam|optimizer|initial|empty"):
+            actor.update_policy(helpers.TestPairedRandomBaselines.baseline_batch())
+        rank_directory = self.root / "archive" / "rank_00000"
+        self.assertFalse((rank_directory / "initial.pt").exists())
+        self.assertFalse(list(rank_directory.glob("frame_*.pt")))
+        self.assertFalse((rank_directory / "COMPLETE.json").exists())
+
+    def test_archive_budget_rejects_frame_without_partial_commit_or_completion(self):
+        # Calibrate against the actual small metadata file, then leave too
+        # little room for even one serialized minibatch. No tensor estimate is
+        # relied on: the writer must enforce bytes while serializing.
+        self.prepare(initial_state="pretrained")
+        calibration = self.actor("calibration", capture=True)
+        calibration.update_policy(helpers.TestPairedRandomBaselines.baseline_batch())
+        calibration.complete_gradient_capture()
+        initial_bytes = (self.root / "archive" / "rank_00000" / "initial_metadata.pt").stat().st_size
+        directory = self.root / "limited_archive"
+        self.prepare(directory, initial_state="pretrained", max_archive_gb=(initial_bytes + 128) / 1_000_000_000)
+        actor = self.actor("limited_capture", capture=True)
+        actor.gradient_record_config["two_stage"]["replay_dir"] = str(directory)
+        with self.assertRaisesRegex((ValueError, RuntimeError, OSError), "budget|limit|quota|exceed|space|capacity"):
+            actor.update_policy(helpers.TestPairedRandomBaselines.baseline_batch())
+        rank_directory = directory / "rank_00000"
+        self.assertFalse(list(rank_directory.glob("frame_*.pt")))
+        self.assertFalse(list(rank_directory.glob("*.tmp")))
+        self.assertFalse((rank_directory / "COMPLETE.json").exists())
 
     def test_unfinished_capture_is_not_replayable(self):
         self.capture(complete=False)

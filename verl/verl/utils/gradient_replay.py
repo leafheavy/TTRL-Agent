@@ -61,25 +61,59 @@ def _file_hash(path):
     return digest.hexdigest()
 
 
-def _atomic_json(path, value, *, replace=False):
+def _atomic_json(path, value, *, replace=False, max_bytes=None):
     path = Path(path)
     if path.exists() and not replace:
         raise FileExistsError(f"Replay file already exists: {path}")
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
-        temporary.write_bytes(_json_bytes(value))
+        encoded = _json_bytes(value)
+        if max_bytes is not None and len(encoded) > max_bytes:
+            raise ValueError("Replay archive capacity limit exceeded while writing metadata")
+        temporary.write_bytes(encoded)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def _atomic_tensor(path, value):
+class _LimitedWriter:
+    """Stop serialization before a tensor file can exceed its remaining budget."""
+
+    def __init__(self, stream, limit):
+        self.stream, self.limit, self.written = stream, limit, 0
+        self.exceeded = False
+
+    def write(self, value):
+        if self.limit is not None and self.written + len(value) > self.limit:
+            self.exceeded = True
+            raise OSError("Replay archive capacity limit exceeded")
+        count = self.stream.write(value)
+        self.written += count
+        return count
+
+    def flush(self):
+        return self.stream.flush()
+
+    def tell(self):
+        return self.stream.tell()
+
+
+def _atomic_tensor(path, value, *, max_bytes=None):
     path = Path(path)
     if path.exists():
         raise FileExistsError(f"Replay tensor file already exists: {path}")
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
-        torch.save(value, temporary)
+        with temporary.open("wb") as stream:
+            limited = _LimitedWriter(stream, max_bytes)
+            try:
+                torch.save(value, limited)
+            except Exception as exc:
+                if limited.exceeded:
+                    raise ValueError(
+                        "Replay archive capacity limit exceeded; use a larger archive budget or volume"
+                    ) from exc
+                raise
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -109,6 +143,16 @@ def prepare_replay_directory(directory, run_config):
         raise FileExistsError(f"Use a new, empty two-stage replay directory: {directory}")
     directory.mkdir(parents=True, exist_ok=True)
     run_config = _plain(run_config)
+    settings = run_config.get("actor_rollout_ref", {}).get("actor", {}).get("gradient_record", {}).get("two_stage", {})
+    initial_state = settings.get("initial_state", "pretrained")
+    max_archive_gb = settings.get("max_archive_gb", 4.0 if initial_state == "pretrained" else None)
+    if initial_state not in ("pretrained", "snapshot"):
+        raise ValueError("two_stage.initial_state must be pretrained or snapshot")
+    if max_archive_gb is not None and (
+        isinstance(max_archive_gb, bool) or not isinstance(max_archive_gb, (int, float))
+        or not math.isfinite(max_archive_gb) or max_archive_gb <= 0
+    ):
+        raise ValueError("two_stage.max_archive_gb must be positive and finite, or null")
     trainer = run_config.get("trainer", {})
     world_size = trainer.get("n_gpus_per_node", 1) * trainer.get("nnodes", 1)
     if isinstance(world_size, bool) or not isinstance(world_size, int) or world_size < 1:
@@ -116,6 +160,7 @@ def prepare_replay_directory(directory, run_config):
     document = {
         "version": VERSION, "run_id": uuid.uuid4().hex, "world_size": world_size,
         "runtime": _runtime(), "run_config": run_config,
+        "initial_state": initial_state, "max_archive_gb": max_archive_gb,
     }
     _atomic_json(directory / "run_config.json", document)
     return document
@@ -256,6 +301,11 @@ class GradientReplayWriter:
         if not 0 <= rank < world_size:
             raise ValueError("Replay rank is outside world_size")
         self.rank, self.world_size = rank, world_size
+        self.initial_state = self.document.get("initial_state", "snapshot")
+        maximum = self.document.get("max_archive_gb")
+        self.byte_budget = None if maximum is None else (
+            int(maximum * 1_000_000_000) - (self.directory / "run_config.json").stat().st_size
+        ) // world_size
         self.rank_directory = self.directory / f"rank_{rank:05d}"
         self.rank_directory.mkdir(exist_ok=False)
         self.manifest = {
@@ -266,11 +316,21 @@ class GradientReplayWriter:
         self.started = False
         self.completed = False
 
+    def _remaining_bytes(self):
+        if self.byte_budget is None:
+            return None
+        used = sum(path.stat().st_size for path in self.rank_directory.iterdir() if path.is_file())
+        return max(0, self.byte_budget - used)
+
     def start(self, trajectory, module, optimizer):
         if self.started:
             raise ValueError("Replay initial state has already been captured")
         if trajectory.updates or trajectory.pending is not None:
             raise ValueError("Replay must start before the first supervised update")
+        if self.initial_state == "pretrained" and any(trajectory.supervised_optimizer_state.values()):
+            raise ValueError(
+                "Pretrained replay requires an empty initial optimizer; model checkpoints will not be saved"
+            )
         parameters = list(module.parameters())
         self.parameter_indices = {id(parameter): index for index, parameter in enumerate(parameters)}
         trainable = [(name, parameter) for name, parameter in module.named_parameters() if parameter.requires_grad]
@@ -279,18 +339,26 @@ class GradientReplayWriter:
             state.append({"index": self.parameter_indices[id(parameter)], "value": _encode(value)})
         initial = {
             "version": VERSION, "run_id": self.document["run_id"], "rank": self.rank,
-            "world_size": self.world_size, "parameters": trajectory.initial_parameters,
+            "world_size": self.world_size, "source": self.initial_state,
             "layouts": [_parameter_layout(name, parameter) for name, parameter in trainable],
             "dtypes": [str(parameter.dtype) for _, parameter in trainable],
-            "buffers": trajectory.supervised_buffers, "optimizer_name": _optimizer_name(optimizer),
-            "optimizer_state": state, "param_groups": _groups(optimizer),
+            "optimizer_name": _optimizer_name(optimizer), "param_groups": _groups(optimizer),
             "group_parameters": [[self.parameter_indices[id(parameter)] for parameter in group["params"]]
                                  for group in optimizer.param_groups],
             "module_fingerprint": _parameter_fingerprint(module),
             "reference": _reference(trajectory, self.parameter_indices),
         }
-        self.manifest["initial_sha256"] = _atomic_tensor(self.rank_directory / "initial.pt", initial)
-        _atomic_json(self.rank_directory / "manifest.json", self.manifest)
+        if self.initial_state == "pretrained":
+            initial["buffer_fingerprint"] = _tree_hash(trajectory.supervised_buffers)
+            self.manifest["initial_file"] = "initial_metadata.pt"
+        else:
+            initial.update(parameters=trajectory.initial_parameters, buffers=trajectory.supervised_buffers,
+                           optimizer_state=state)
+            self.manifest["initial_file"] = "initial.pt"
+        self.manifest["initial_sha256"] = _atomic_tensor(
+            self.rank_directory / self.manifest["initial_file"], initial, max_bytes=self._remaining_bytes()
+        )
+        _atomic_json(self.rank_directory / "manifest.json", self.manifest, max_bytes=self._remaining_bytes())
         self.started = True
 
     def begin(self, micro_batches, *, metadata, temperature, gradient_accumulation, optimizer, device_name):
@@ -330,14 +398,15 @@ class GradientReplayWriter:
         frame["expected_reference"] = _reference(trajectory, self.parameter_indices)
         frame["result"] = _plain(result)
         name = f"frame_{frame['sequence']:08d}.pt"
-        digest = _atomic_tensor(self.rank_directory / name, frame)
+        digest = _atomic_tensor(self.rank_directory / name, frame, max_bytes=self._remaining_bytes())
         previous = (self.manifest["frames"][-1]["sha256"] if self.manifest["frames"]
                     else self.manifest["initial_sha256"])
         self.manifest["frames"].append({
             "sequence": frame["sequence"], "update": frame["update"], "file": name,
             "sha256": digest, "previous_sha256": previous,
         })
-        _atomic_json(self.rank_directory / "manifest.json", self.manifest, replace=True)
+        _atomic_json(self.rank_directory / "manifest.json", self.manifest, replace=True,
+                     max_bytes=self._remaining_bytes())
         self.pending = None
 
     def complete(self):
@@ -347,7 +416,7 @@ class GradientReplayWriter:
             "run_id": self.document["run_id"], "rank": self.rank,
             "updates": len(self.manifest["frames"]),
             "manifest_sha256": _file_hash(self.rank_directory / "manifest.json"),
-        })
+        }, max_bytes=self._remaining_bytes())
         self.completed = True
 
 
@@ -377,9 +446,12 @@ class GradientReplayReader:
                     or complete.get("run_id") != self.document["run_id"]
                     or complete.get("manifest_sha256") != _file_hash(location / "manifest.json")):
                 raise ValueError("Replay rank manifest identity or checksum mismatch")
-            if not (location / "initial.pt").is_file():
+            initial_file = manifest.get("initial_file", "initial.pt")
+            if initial_file not in ("initial.pt", "initial_metadata.pt"):
+                raise ValueError("Replay initial metadata filename is invalid")
+            if not (location / initial_file).is_file():
                 raise ValueError("Replay archive is missing its initial optimizer state")
-            if _file_hash(location / "initial.pt") != manifest["initial_sha256"]:
+            if _file_hash(location / initial_file) != manifest["initial_sha256"]:
                 raise ValueError("Replay initial-state checksum mismatch")
             frames = manifest.get("frames", [])
             if not frames or complete.get("updates") != len(frames):
@@ -410,7 +482,7 @@ class GradientReplayReader:
     @property
     def initial(self):
         if self._initial is None:
-            path = self.rank_directory / "initial.pt"
+            path = self.rank_directory / self.manifest.get("initial_file", "initial.pt")
             if _file_hash(path) != self.manifest["initial_sha256"]:
                 raise ValueError("Replay initial-state checksum mismatch")
             self._initial = torch.load(path, map_location="cpu", weights_only=True)
@@ -438,21 +510,28 @@ class GradientReplayReader:
         if groups != initial["group_parameters"]:
             raise ValueError("Replay optimizer parameter grouping differs")
         buffers = dict(module.named_buffers())
-        if buffers.keys() != initial["buffers"].keys():
-            raise ValueError("Replay model buffers differ")
-        with torch.no_grad():
-            for (_, parameter), value in zip(trainable, initial["parameters"]):
-                _local(parameter).copy_(value)
-            for name, buffer in buffers.items():
-                value = initial["buffers"][name]
-                if buffer.shape != value.shape or buffer.dtype != value.dtype:
-                    raise ValueError("Replay model buffer shape or dtype differs")
-                buffer.copy_(value)
+        source = initial.get("source", "snapshot")
+        if source == "pretrained":
+            if _tree_hash(buffers) != initial["buffer_fingerprint"]:
+                raise ValueError("Pretrained replay initial model buffers do not match stage one")
+        elif source == "snapshot":
+            if buffers.keys() != initial["buffers"].keys():
+                raise ValueError("Replay model buffers differ")
+            with torch.no_grad():
+                for (_, parameter), value in zip(trainable, initial["parameters"]):
+                    _local(parameter).copy_(value)
+                for name, buffer in buffers.items():
+                    value = initial["buffers"][name]
+                    if buffer.shape != value.shape or buffer.dtype != value.dtype:
+                        raise ValueError("Replay model buffer shape or dtype differs")
+                    buffer.copy_(value)
+        else:
+            raise ValueError("Replay initial state source is invalid")
         if _parameter_fingerprint(module) != initial["module_fingerprint"]:
             raise ValueError("Replay initial model fingerprint differs, including frozen parameters")
         optimizer.zero_grad()
         optimizer.state = defaultdict(dict)
-        for entry in initial["optimizer_state"]:
+        for entry in initial.get("optimizer_state", []):
             parameter = parameters[entry["index"]]
             optimizer.state[parameter] = _decode(entry["value"], parameter.device)
         _restore_groups(optimizer, initial["param_groups"])

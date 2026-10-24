@@ -142,6 +142,14 @@ def validate_gradient_recording(config):
             raise ValueError("Two-stage capture requires single_step.enabled=False")
         if not two_stage.get("replay_dir"):
             raise ValueError("Two-stage capture requires two_stage.replay_dir")
+        if two_stage.get("initial_state", "pretrained") not in ("pretrained", "snapshot"):
+            raise ValueError("two_stage.initial_state must be pretrained or snapshot")
+        archive_budget = two_stage.get("max_archive_gb", 4.0)
+        if archive_budget is not None and (
+            isinstance(archive_budget, bool) or not isinstance(archive_budget, (int, float))
+            or not math.isfinite(archive_budget) or archive_budget <= 0
+        ):
+            raise ValueError("two_stage.max_archive_gb must be positive and finite, or null")
         if config.trainer.get("resume_mode", "auto") != "disable":
             raise ValueError("Two-stage capture requires trainer.resume_mode=disable and a fresh archive")
         if config.trainer.get("post_train_eval", {}).get("enabled", False):

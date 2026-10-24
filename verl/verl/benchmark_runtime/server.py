@@ -9,7 +9,7 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock, Thread
 
 SESSION_OPERATIONS = frozenset({"parse_calls", "execute", "malformed_response", "finish_turn", "outcome"})
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
@@ -122,6 +122,35 @@ class RequestHandler(BaseHTTPRequestHandler):
         pass
 
 
+class BenchmarkHTTPServer(ThreadingHTTPServer):
+    """Keep accepting RPCs while benchmark initialization holds runtime locks."""
+
+    # A batch of 16 prompts with eight rollouts already opens 128 sessions.
+    request_queue_size = 256
+    cleanup_interval_s = 1.0
+
+    def serve_forever(self, poll_interval=0.5):
+        stop = Event()
+
+        def reap_sessions():
+            # Adapter/session cleanup can block. It must never run in the
+            # accept loop, including through BaseServer.service_actions().
+            while not stop.wait(self.cleanup_interval_s):
+                try:
+                    self.runtime.reap_expired()
+                except Exception:
+                    traceback.print_exc()
+
+        reaper = Thread(target=reap_sessions, name="benchmark-session-reaper", daemon=True)
+        self._reaper_thread = reaper
+        reaper.start()
+        try:
+            super().serve_forever(poll_interval=poll_interval)
+        finally:
+            stop.set()
+            reaper.join(timeout=1)
+
+
 def load_adapter(path):
     spec = importlib.util.spec_from_file_location("_benchmark_adapter", Path(path).resolve())
     module = importlib.util.module_from_spec(spec)
@@ -140,14 +169,11 @@ def main():
     runtime = Runtime(load_adapter(args.adapter), args.session_ttl_s)
     # Check adapter imports before advertising a healthy runtime.
     print(json.dumps(runtime.dispatch("health", {})), flush=True)
-    with ThreadingHTTPServer((args.host, args.port), RequestHandler) as server:
+    with BenchmarkHTTPServer((args.host, args.port), RequestHandler) as server:
         server.runtime = runtime
-        server.timeout = 1
         print(f"Benchmark runtime listening on http://{args.host}:{server.server_port}", flush=True)
         try:
-            while True:
-                server.handle_request()
-                runtime.reap_expired()
+            server.serve_forever()
         except KeyboardInterrupt:
             pass
         finally:

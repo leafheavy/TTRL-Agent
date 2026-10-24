@@ -250,6 +250,11 @@ actor_rollout_ref:
       two_stage:
         enabled: false
         replay_dir: ${trainer.default_local_dir}/gradient_replay
+        # Reuse the existing original model; write no parameter/Adam checkpoint.
+        # Requires a fresh, empty optimizer and an exactly matching model origin.
+        initial_state: pretrained
+        # Decimal GB, shared across ranks; leave space for other run files.
+        max_archive_gb: 4.0
 
       # Derived from the run directory; paired needs trajectory or single_step enabled.
       # All ranks share this directory on multi-GPU jobs.
