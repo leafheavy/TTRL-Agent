@@ -1,18 +1,24 @@
 """Run by file path in a benchmark venv; does not import the verl package."""
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
+import os
 import sys
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event, RLock, Thread
+from uuid import uuid4
 
 SESSION_OPERATIONS = frozenset({"parse_calls", "execute", "malformed_response", "finish_turn", "outcome"})
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
+# Capture this when the code is loaded, rather than hashing a possibly updated
+# file each time a still-running process receives a health request.
+SERVER_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 class Runtime:
@@ -23,6 +29,12 @@ class Runtime:
         self.session_ttl_s = session_ttl_s
         self.sessions = {}
         self.lock = RLock()
+        self.identity = {
+            "pid": os.getpid(),
+            "runtime_id": uuid4().hex,
+            "started_at_unix_s": time.time(),
+            "server_sha256": SERVER_SHA256,
+        }
 
     def reap_expired(self):
         now = time.monotonic()
@@ -40,6 +52,7 @@ class Runtime:
         if method == "health":
             return {
                 **self.adapter.health(),
+                **self.identity,
                 "backend": self.adapter.name,
                 "python": sys.executable,
                 "active_sessions": len(self.sessions),
@@ -168,9 +181,10 @@ def main():
     args = parser.parse_args()
     runtime = Runtime(load_adapter(args.adapter), args.session_ttl_s)
     # Check adapter imports before advertising a healthy runtime.
-    print(json.dumps(runtime.dispatch("health", {})), flush=True)
+    health = runtime.dispatch("health", {})
     with BenchmarkHTTPServer((args.host, args.port), RequestHandler) as server:
         server.runtime = runtime
+        print(json.dumps(health), flush=True)
         print(f"Benchmark runtime listening on http://{args.host}:{server.server_port}", flush=True)
         try:
             server.serve_forever()

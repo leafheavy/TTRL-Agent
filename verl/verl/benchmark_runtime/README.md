@@ -25,6 +25,22 @@ depending on shell-variable inheritance. Startup checks the backend before Ray
 or model allocation. No fallback imports BFCL into the training process.
 The documented loopback endpoint supports the current single-node recipe.
 
+Health reports the responding process's `pid`, `runtime_id`,
+`started_at_unix_s`, and `server_sha256` captured when the server code is loaded.
+When launching in the background, verify the returned PID against `$!` with
+`client.py --endpoint ... --backend bfcl --expect-pid "$pid" --wait-s 30`.
+Optionally pass `--expect-server-sha256` to check the loaded server revision.
+Checking backend health and then `kill -0` separately does not prove that the
+endpoint belongs to the newly launched process: an existing listener may reply
+while the new child is still importing dependencies and has not yet failed to
+bind the occupied port. Identity mismatches fail immediately. Readiness is
+printed only after binding succeeds.
+
+`active_sessions` counts rollout environments inside that process, not service
+processes. A fresh runtime starts with zero sessions; each rollout creates one,
+and failed runs may leave sessions until their idle TTL expires. A health check
+does not create a session or test session creation under training load.
+
 For BFCL multi-turn runs, keep `rollout.mode=async`,
 `data.return_raw_chat=True` and GRPO enabled. Tool schemas and interactions come
 from the remote session, so `multi_turn.tool_config_path` and

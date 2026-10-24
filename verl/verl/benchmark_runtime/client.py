@@ -14,6 +14,10 @@ class BenchmarkRuntimeError(RuntimeError):
     """Transport or remote adapter failure; never convert it into a task reward."""
 
 
+class RuntimeIdentityError(BenchmarkRuntimeError):
+    """A healthy endpoint belongs to a different process or loaded code."""
+
+
 class RuntimeClient:
     def __init__(self, endpoint, timeout_s=120):
         if not isinstance(endpoint, str) or not endpoint:
@@ -56,10 +60,17 @@ class RuntimeClient:
             raise BenchmarkRuntimeError("Benchmark runtime response has no result")
         return result["result"]
 
-    def health(self, expected_backend=None):
+    def health(self, expected_backend=None, expected_pid=None, expected_server_sha256=None):
         result = self.call("health")
         if expected_backend is not None and result.get("backend") != expected_backend:
             raise BenchmarkRuntimeError(f"Expected {expected_backend!r} runtime, got {result.get('backend')!r}")
+        for field, expected in (("pid", expected_pid), ("server_sha256", expected_server_sha256)):
+            if expected is not None and result.get(field) != expected:
+                raise RuntimeIdentityError(
+                    f"Runtime identity mismatch at {self.endpoint}: expected {field}={expected!r}, "
+                    f"got {result.get(field)!r}. Check the process listening on this endpoint; "
+                    "an older runtime may still be running."
+                )
         return result
 
 
@@ -136,13 +147,22 @@ def main():
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--backend", default=None)
     parser.add_argument("--wait-s", type=float, default=0)
+    parser.add_argument("--expect-pid", type=int, help="Require the responding server to be this process")
+    parser.add_argument("--expect-server-sha256", help="Require this hash of the server source loaded at startup")
     args = parser.parse_args()
     deadline = time.monotonic() + args.wait_s
     client = RuntimeClient(args.endpoint, timeout_s=2)
     while True:
         try:
-            print(json.dumps(client.health(args.backend), ensure_ascii=False))
+            print(
+                json.dumps(
+                    client.health(args.backend, args.expect_pid, args.expect_server_sha256), ensure_ascii=False
+                )
+            )
             return
+        except RuntimeIdentityError:
+            # Waiting cannot make a new process bind a port held by this one.
+            raise
         except BenchmarkRuntimeError:
             if time.monotonic() >= deadline:
                 raise
