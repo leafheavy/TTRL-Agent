@@ -28,6 +28,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import chain
 from pathlib import Path
 from pprint import pprint
 from typing import Optional, Type
@@ -621,6 +622,7 @@ class RayPPOTrainer:
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+        self._validate_epoch_failure_schedule()
 
         print(
             f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
@@ -644,6 +646,70 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _validate_epoch_failure_schedule(self):
+        """Dynamic weights require complete, comparable passes over the case set."""
+        dynamic = self.config.get("failure_mode_detection", {}).get("advantage_weight", {}).get(
+            "epoch_frequency", {}
+        )
+        if not dynamic.get("enabled", False):
+            return
+        batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+        sampler = self.train_dataloader.sampler
+        if (
+            len(self.train_dataset) % batch_size or len(sampler) != len(self.train_dataset)
+            or getattr(sampler, "replacement", False)
+        ):
+            raise ValueError("epoch_frequency requires every case once per epoch without a dropped tail batch")
+        steps = self.config.trainer.get("total_training_steps")
+        batches = len(self.train_dataloader)
+        if steps is not None and (
+            isinstance(steps, bool) or not isinstance(steps, int)
+            or steps < 2 * batches or steps % batches
+            or steps > batches * self.config.trainer.total_epochs
+        ):
+            raise ValueError("epoch_frequency total_training_steps must span at least two complete available epochs")
+
+    def _finish_failure_epoch(self, epoch_iterator):
+        """Finalize before checkpointing, including the final training step."""
+        if not self.epoch_failure_weights.enabled:
+            return {}
+        self._failure_epoch_batches += 1
+        if self._failure_epoch_batches > len(self.train_dataloader):
+            raise RuntimeError("epoch_frequency observed more batches than one complete epoch")
+        if self._failure_epoch_batches != len(self.train_dataloader):
+            return {}
+        # StatefulDataLoader marks its state as finished only after StopIteration.
+        # Consume it now so a boundary checkpoint resumes at the next full epoch.
+        try:
+            next(epoch_iterator)
+        except StopIteration:
+            pass
+        else:
+            raise RuntimeError("epoch_frequency dataloader produced more batches than its declared length")
+        expected_rollouts = len(self.train_dataset) * self.config.actor_rollout_ref.rollout.n
+        if self.epoch_failure_weights.total_rollouts != expected_rollouts:
+            raise RuntimeError("epoch_frequency rollout counts do not cover every case with the configured N")
+        metrics = self.epoch_failure_weights.finish_epoch()
+        self._failure_epoch_batches = 0
+        return {f"train/{key}": value for key, value in metrics.items()}
+
+    def _training_epoch_iterator(self):
+        iterator = iter(self.train_dataloader)
+        if not self._failure_resume_boundary:
+            return iterator
+        self._failure_resume_boundary = False
+        # torchdata versions differ on restoring an exhausted iterator: some
+        # expose one empty pass before constructing the next epoch's iterator.
+        try:
+            first = next(iterator)
+        except StopIteration:
+            iterator = iter(self.train_dataloader)
+            try:
+                first = next(iterator)
+            except StopIteration as exc:
+                raise RuntimeError("Cannot resume the next epoch from the saved dataloader state") from exc
+        return chain((first,), iterator)
 
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1064,6 +1130,18 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        controller = getattr(self, "epoch_failure_weights", None)
+        if controller is not None and controller.enabled:
+            failure_state = {
+                "controller": controller.state_dict(),
+                "batches_in_epoch": self._failure_epoch_batches,
+                "batches_per_epoch": len(self.train_dataloader),
+                "rollouts_per_batch": self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+                * self.config.actor_rollout_ref.rollout.n,
+            }
+            with open(os.path.join(local_global_step_folder, "epoch_failure_weights.json"), "w") as handle:
+                json.dump(failure_state, handle, indent=2)
+
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
@@ -1106,6 +1184,31 @@ class RayPPOTrainer:
 
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
+
+        controller = getattr(self, "epoch_failure_weights", None)
+        if controller is not None and controller.enabled:
+            state_path = Path(global_step_folder) / "epoch_failure_weights.json"
+            if not state_path.is_file() or not (Path(global_step_folder) / "data.pt").is_file():
+                raise ValueError("Dynamic failure weighting resume requires both its saved state and data.pt")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            batches = len(self.train_dataloader)
+            rollouts = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+            rollouts *= self.config.actor_rollout_ref.rollout.n
+            partial_batches = state.get("batches_in_epoch")
+            if (
+                state.get("batches_per_epoch") != batches or state.get("rollouts_per_batch") != rollouts
+                or isinstance(partial_batches, bool) or not isinstance(partial_batches, int)
+                or not 0 <= partial_batches < batches
+            ):
+                raise ValueError("Dynamic failure weighting resume requires the original data and rollout schedule")
+            controller.load_state_dict(state["controller"])
+            if (
+                controller.completed_epochs * batches + partial_batches != self.global_steps
+                or state["controller"]["total_rollouts"] != partial_batches * rollouts
+            ):
+                raise ValueError("Dynamic failure weighting checkpoint does not match the saved training step")
+            self._failure_epoch_batches = partial_batches
+            self._failure_resume_boundary = partial_batches == 0
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
@@ -1150,10 +1253,18 @@ class RayPPOTrainer:
         ttrl = self.config.get("ttrl", {})
         failure_detection = self.config.get("failure_mode_detection", {})
         failure_weight = failure_detection.get("advantage_weight", {})
-        if failure_weight.get("enabled", False) is not False:
+        dynamic = failure_weight.get("epoch_frequency", {})
+        if not hasattr(dynamic, "get"):
+            raise ValueError("failure advantage epoch_frequency must be a mapping")
+        dynamic_enabled = dynamic.get("enabled", False)
+        if failure_weight.get("enabled", False) is not False or dynamic_enabled is not False:
             from verl.trainer.ppo.ttrl_utils import validate_failure_weight_config
 
             validate_failure_weight_config(failure_weight)
+            if dynamic_enabled:
+                epochs = self.config.trainer.get("total_epochs", 1)
+                if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 2:
+                    raise ValueError("epoch_frequency requires trainer.total_epochs >= 2 to use updated weights")
             rollout = self.config.actor_rollout_ref.rollout
             if not failure_detection.get("enabled", False):
                 raise ValueError("Failure advantage weighting requires failure_mode_detection.enabled=True")
@@ -1239,6 +1350,7 @@ class RayPPOTrainer:
             raise ValueError("TTRL with async or SGLang multi-turn rollout requires ttrl.share_rollouts=True")
 
     def _paired_gradient_due(self):
+        """Prepare labels for every trajectory update or an explicit legacy snapshot."""
         from verl.utils.gradient_diagnostics import paired_recording_due
 
         record = self.config.actor_rollout_ref.get("actor", {}).get("gradient_record", {})
@@ -1415,6 +1527,13 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+        from verl.trainer.ppo.ttrl_utils import EpochFailureWeights
+
+        self.epoch_failure_weights = EpochFailureWeights(
+            self.config.get("failure_mode_detection", {}).get("advantage_weight", {})
+        )
+        self._failure_epoch_batches = 0
+        self._failure_resume_boundary = False
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1437,8 +1556,13 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
-        for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+        start_epoch = self.epoch_failure_weights.completed_epochs if self.epoch_failure_weights.enabled else 0
+        if self.global_steps > self.total_training_steps:
+            progress_bar.close()
+            return
+        for epoch in range(start_epoch, self.config.trainer.total_epochs):
+            epoch_iterator = self._training_epoch_iterator()
+            for batch_dict in epoch_iterator:
                 do_profile = (
                     self.global_steps in self.config.trainer.profile_steps
                     if self.config.trainer.profile_steps is not None
@@ -1505,6 +1629,8 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                     batch = batch.union(gen_batch_output)
+                    # Count each newly sampled rollout once, outside PPO reuse and validation.
+                    self.epoch_failure_weights.observe(batch)
 
                     if "response_mask" not in batch.batch:
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1624,7 +1750,7 @@ class RayPPOTrainer:
                         from verl.trainer.ppo.ttrl_utils import apply_ttrl_failure_weights
 
                         failure_weight_metrics = apply_ttrl_failure_weights(
-                            batch, self.config.get("failure_mode_detection", {}).get("advantage_weight", {})
+                            batch, self.epoch_failure_weights.effective_config()
                         )
                         metrics.update({f"train/{key}": value for key, value in failure_weight_metrics.items()})
                         self._prepare_paired_gradient_advantages(batch)
@@ -1643,9 +1769,7 @@ class RayPPOTrainer:
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             if self.config.actor_rollout_ref.actor.get("gradient_record", {}).get("enabled", False):
                                 ttrl = self.config.get("ttrl", {})
-                                failure_weight = self.config.get("failure_mode_detection", {}).get(
-                                    "advantage_weight", {}
-                                )
+                                failure_weight = self.epoch_failure_weights.effective_config()
                                 batch.meta_info["gradient_record"] = {
                                     "step": self.global_steps,
                                     "final_step": is_last_step,
@@ -1709,6 +1833,8 @@ class RayPPOTrainer:
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
 
+                    metrics.update(self._finish_failure_epoch(epoch_iterator))
+
                     esi_close_to_expiration = should_save_ckpt_esi(
                         max_steps_duration=self.max_steps_duration,
                         redundant_time=self.config.trainer.esi_redundant_time,
@@ -1758,3 +1884,5 @@ class RayPPOTrainer:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
+            if self.epoch_failure_weights.enabled and self._failure_epoch_batches:
+                raise RuntimeError("epoch_frequency dataloader ended before covering the complete epoch")

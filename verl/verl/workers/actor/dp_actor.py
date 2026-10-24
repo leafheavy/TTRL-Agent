@@ -588,17 +588,32 @@ class DataParallelPPOActor(BasePPOActor):
     def _advance_supervised_trajectory(self, micro_batches, temperature, devices):
         from verl.utils.gradient_diagnostics import OptimizationTrajectory
 
+        baseline_config = self.gradient_record_config.get("baselines", {})
+        baselines_enabled = baseline_config.get("enabled", False)
         if not hasattr(self, "optimization_trajectory"):
-            self.optimization_trajectory = OptimizationTrajectory(self.actor_module, self.actor_optimizer)
+            self.optimization_trajectory = OptimizationTrajectory(
+                self.actor_module,
+                self.actor_optimizer,
+                baselines=baselines_enabled,
+                seed=baseline_config.get("seed", 0),
+            )
 
-        def update():
+        def update(advantages_key="diagnostic_supervised_advantages"):
             self._backward_micro_batches(
-                micro_batches, temperature, {}, advantages_key="diagnostic_supervised_advantages"
+                micro_batches, temperature, {}, advantages_key=advantages_key
             )
             self._optimizer_step()
 
         with torch.random.fork_rng(devices=devices, device_type=self.device_name):
-            self.optimization_trajectory.supervised_step(self.actor_module, self.actor_optimizer, update)
+            self.optimization_trajectory.supervised_step(
+                self.actor_module,
+                self.actor_optimizer,
+                update,
+                shuffled_callback=(lambda: update("diagnostic_shuffled_advantages")) if baselines_enabled else None,
+                rank=torch.distributed.get_rank(),
+                world_size=torch.distributed.get_world_size(),
+                device=torch.device(self.device_name, devices[0]) if devices else None,
+            )
 
     def _finish_optimization_trajectory(self, metadata, epoch, batch_idx):
         from verl.utils.gradient_diagnostics import recording_due, save_trajectory_statistics
@@ -634,11 +649,14 @@ class DataParallelPPOActor(BasePPOActor):
         )
         record_gradient = False
         if self.gradient_record_config.get("enabled", False):
-            from verl.utils.gradient_diagnostics import recording_due
+            from verl.utils.gradient_diagnostics import paired_recording_due, recording_due
 
             if gradient_metadata is None:
                 raise ValueError("Policy gradient recording requires trainer step metadata")
-            record_gradient = recording_due(self.gradient_record_config, gradient_metadata["step"])
+            due = (
+                paired_recording_due if self.gradient_record_config.get("mode", "full") == "paired" else recording_due
+            )
+            record_gradient = due(self.gradient_record_config, gradient_metadata["step"])
 
         select_keys = [
             "responses",
@@ -655,7 +673,7 @@ class DataParallelPPOActor(BasePPOActor):
             if "diagnostic_supervised_advantages" not in data.batch:
                 raise ValueError("Paired policy gradients require trainer-provided supervised advantages")
             select_keys.append("diagnostic_supervised_advantages")
-            if record_gradient and self.gradient_record_config.get("baselines", {}).get("enabled", False):
+            if self.gradient_record_config.get("baselines", {}).get("enabled", False):
                 if "diagnostic_shuffled_advantages" not in data.batch:
                     raise ValueError("Paired baselines require trainer-provided shuffled advantages")
                 select_keys.append("diagnostic_shuffled_advantages")

@@ -4,6 +4,7 @@ import ast
 import asyncio
 import builtins
 import importlib.util
+import json
 import os
 import shlex
 import sys
@@ -11,6 +12,7 @@ import tempfile
 import time
 import unittest
 from contextlib import asynccontextmanager
+from itertools import chain
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -36,7 +38,9 @@ def load_validation():
     methods = [
         node for node in trainer.body
         if getattr(node, "name", None) in (
-            "_validate_config", "_validate_ttrl_config", "_validate_post_train_eval_config", "serve_after_training"
+            "_validate_config", "_validate_ttrl_config", "_validate_post_train_eval_config", "serve_after_training",
+            "_validate_epoch_failure_schedule", "_finish_failure_epoch", "_training_epoch_iterator",
+            "_save_checkpoint", "_load_checkpoint",
         )
     ]
     validation_class = ast.ClassDef(name="TrainerValidation", bases=[], keywords=[], body=methods, decorator_list=[])
@@ -47,6 +51,9 @@ def load_validation():
         "shlex": shlex,
         "tempfile": tempfile,
         "time": time,
+        "os": os,
+        "json": json,
+        "chain": chain,
     }
     exec(compile(module, str(path), "exec"), namespace)
 
@@ -60,6 +67,9 @@ def load_validation():
     weight_validators = [
         node for node in tree.body
         if getattr(node, "name", None) in ("validate_failure_weight_config", "validate_q_weight_config")
+        or isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "_FAILURE_TYPE_WEIGHTS" for target in node.targets
+        )
     ]
     weight_module = ModuleType("verl.trainer.ppo.ttrl_utils")
     weight_module.np = np
@@ -252,6 +262,58 @@ class TestTrainerMultiTurnConfig(unittest.TestCase):
         self.config.actor_rollout_ref.rollout.multi_turn.tool_config_path = "native_tools.yaml"
         self.trainer._validate_config()
 
+    def test_epoch_frequency_requires_enabled_weighting_and_multiple_epochs(self):
+        self.config.failure_mode_detection = Config(enabled=True, advantage_weight=Config(
+            enabled=False, epoch_frequency=Config(enabled=True),
+        ))
+        with self.assertRaisesRegex(ValueError, "epoch_frequency requires"):
+            self.trainer._validate_config()
+        self.config.failure_mode_detection.advantage_weight.enabled = True
+        for epochs in (1, 0, True, "2"):
+            with self.subTest(epochs=epochs):
+                self.config.trainer.total_epochs = epochs
+                with self.assertRaisesRegex(ValueError, "total_epochs >= 2"):
+                    self.trainer._validate_config()
+        self.config.trainer.total_epochs = 2
+        self.trainer._validate_config()
+
+    def test_epoch_frequency_rejects_dropped_cases_and_incomplete_training(self):
+        self.config.failure_mode_detection = Config(enabled=True, advantage_weight=Config(
+            enabled=True, epoch_frequency=Config(enabled=True),
+        ))
+        self.config.trainer.total_epochs = 3
+        self.trainer.train_dataset = list(range(8))
+
+        class Loader:
+            sampler = list(range(8))
+
+            def __len__(self):
+                return 4
+
+        self.trainer.train_dataloader = Loader()
+        for steps in (None, 8, 12):
+            self.config.trainer.total_training_steps = steps
+            self.trainer._validate_epoch_failure_schedule()
+        for steps in (4, 5, 9, 16, True, "8"):
+            with self.subTest(steps=steps):
+                self.config.trainer.total_training_steps = steps
+                with self.assertRaisesRegex(ValueError, "two complete available epochs"):
+                    self.trainer._validate_epoch_failure_schedule()
+        self.config.trainer.total_training_steps = None
+        self.trainer.train_dataset.append(8)
+        with self.assertRaisesRegex(ValueError, "every case once"):
+            self.trainer._validate_epoch_failure_schedule()
+        self.trainer.train_dataset.pop()
+        self.trainer.train_dataloader.sampler = [0, 1]
+        with self.assertRaisesRegex(ValueError, "every case once"):
+            self.trainer._validate_epoch_failure_schedule()
+        class ReplacementSampler(list):
+            replacement = True
+
+        self.trainer.train_dataloader.sampler = ReplacementSampler(range(8))
+        with self.assertRaisesRegex(ValueError, "every case once"):
+            self.trainer._validate_epoch_failure_schedule()
+
     def test_async_agent_worker_count_is_validated_before_model_initialization(self):
         for count in (0, -1, True, 1.5, "8", None):
             with self.subTest(count=count):
@@ -325,6 +387,146 @@ class TestTrainerMultiTurnConfig(unittest.TestCase):
         self.config.actor_rollout_ref.rollout.multi_turn.enable = False
         self.config.ttrl.consensus.mode = "calls"
         self.trainer._validate_config()
+
+
+class TestEpochFailureLifecycle(unittest.TestCase):
+    def setUp(self):
+        trainer_type, _, _ = load_validation()
+        self.trainer = trainer_type()
+        self.trainer.config = smoke_config()
+        self.trainer.config.trainer.update(
+            total_epochs=2, resume_mode="resume_path", default_hdfs_dir=None, del_local_ckpt_after_load=False,
+        )
+        self.trainer.use_critic = False
+        self.trainer.actor_rollout_wg = SimpleNamespace(save_checkpoint=Mock(), load_checkpoint=Mock())
+        self.trainer._failure_epoch_batches = 0
+        self.trainer._failure_resume_boundary = False
+        self.trainer.epoch_failure_weights = SimpleNamespace(
+            enabled=True, completed_epochs=0, total_rollouts=8,
+            finish_epoch=Mock(return_value={"failure_epoch_completed": 1}),
+            state_dict=Mock(return_value={"completed_epochs": 0, "total_rollouts": 4}),
+        )
+
+        def load_failure_state(state):
+            self.trainer.epoch_failure_weights.completed_epochs = state["completed_epochs"]
+
+        self.trainer.epoch_failure_weights.load_state_dict = Mock(side_effect=load_failure_state)
+
+    def test_epoch_finishes_only_after_last_batch_and_exhausts_before_saving(self):
+        self.trainer.train_dataset = list(range(4))
+        self.trainer.train_dataloader = [1, 2]
+        iterator = iter(self.trainer.train_dataloader)
+        next(iterator)
+        self.assertEqual(self.trainer._finish_failure_epoch(iterator), {})
+        self.trainer.epoch_failure_weights.finish_epoch.assert_not_called()
+        next(iterator)
+        self.assertEqual(self.trainer._finish_failure_epoch(iterator), {"train/failure_epoch_completed": 1})
+        self.trainer.epoch_failure_weights.finish_epoch.assert_called_once_with()
+        self.assertEqual(self.trainer._failure_epoch_batches, 0)
+        self.assertEqual(list(iterator), [])
+
+    def test_resume_boundary_retries_one_empty_iterator_without_losing_first_batch(self):
+        loader = Mock()
+        loader.__iter__ = Mock(side_effect=[iter(()), iter(("first", "second"))])
+        self.trainer.train_dataloader = loader
+        self.trainer._failure_resume_boundary = True
+        self.assertEqual(list(self.trainer._training_epoch_iterator()), ["first", "second"])
+        self.assertFalse(self.trainer._failure_resume_boundary)
+        self.assertEqual(loader.__iter__.call_count, 2)
+
+    def test_resume_boundary_does_not_retry_a_loader_that_already_starts_next_epoch(self):
+        self.trainer.train_dataloader = ["first", "second"]
+        self.trainer._failure_resume_boundary = True
+        self.assertEqual(list(self.trainer._training_epoch_iterator()), ["first", "second"])
+
+    def test_resume_partial_epoch_does_not_restart_or_drop_remaining_batches(self):
+        self.trainer.train_dataloader = ["remaining"]
+        self.trainer._failure_epoch_batches = 1
+        self.assertEqual(list(self.trainer._training_epoch_iterator()), ["remaining"])
+
+    def test_incomplete_rollout_budget_is_not_committed_as_a_full_epoch(self):
+        self.trainer.train_dataloader = ["last"]
+        self.trainer.train_dataset = list(range(4))
+        self.trainer.epoch_failure_weights.total_rollouts = 7
+        iterator = iter(self.trainer.train_dataloader)
+        next(iterator)
+        with self.assertRaisesRegex(RuntimeError, "rollout counts do not cover every case"):
+            self.trainer._finish_failure_epoch(iterator)
+        self.trainer.epoch_failure_weights.finish_epoch.assert_not_called()
+
+    def test_missing_dynamic_checkpoint_state_is_rejected_before_loading_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "global_step_1"
+            checkpoint.mkdir()
+            self.trainer.config.trainer.update(default_local_dir=directory, resume_from_path=str(checkpoint))
+            namespace = self.trainer._load_checkpoint.__globals__
+            with patch.dict(namespace, find_latest_ckpt_path=lambda _: None):
+                with self.assertRaisesRegex(ValueError, "requires both its saved state and data.pt"):
+                    self.trainer._load_checkpoint()
+        self.trainer.actor_rollout_wg.load_checkpoint.assert_not_called()
+
+    def test_checkpoint_round_trip_retains_partial_counts_and_restores_epoch_position(self):
+        class Loader:
+            def __init__(self):
+                self.state = {"position": 1}
+
+            def __len__(self):
+                return 2
+
+            def state_dict(self):
+                return self.state
+
+            def load_state_dict(self, state):
+                self.state = state
+
+        loader = Loader()
+        self.trainer.train_dataloader = loader
+        self.trainer.global_steps = 1
+        self.trainer._failure_epoch_batches = 1
+        namespace = self.trainer._save_checkpoint.__globals__
+        filesystem = ModuleType("verl.utils.fs")
+        filesystem.local_mkdir_safe = lambda path: Path(path).mkdir(parents=True, exist_ok=True)
+        fake_torch = SimpleNamespace(
+            save=lambda state, path: Path(path).write_text(json.dumps(state), encoding="utf-8"),
+            load=lambda path, weights_only: json.loads(Path(path).read_text(encoding="utf-8")),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "global_step_1"
+            self.trainer.config.trainer.update(default_local_dir=directory, resume_from_path=str(checkpoint))
+            with patch.dict(sys.modules, {"verl.utils.fs": filesystem}), patch.dict(
+                namespace, torch=fake_torch, find_latest_ckpt_path=lambda _: None,
+            ):
+                self.trainer._save_checkpoint()
+                self.trainer._failure_epoch_batches = 0
+                loader.state = {}
+                self.trainer._load_checkpoint()
+            self.assertEqual(loader.state, {"position": 1})
+            self.assertEqual(self.trainer._failure_epoch_batches, 1)
+            self.assertFalse(self.trainer._failure_resume_boundary)
+            self.trainer.epoch_failure_weights.load_state_dict.assert_called_once_with(
+                {"completed_epochs": 0, "total_rollouts": 4}
+            )
+            state_path = checkpoint / "epoch_failure_weights.json"
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            saved["rollouts_per_batch"] = 99
+            state_path.write_text(json.dumps(saved), encoding="utf-8")
+            with patch.dict(namespace, find_latest_ckpt_path=lambda _: None):
+                with self.assertRaisesRegex(ValueError, "original data and rollout schedule"):
+                    self.trainer._load_checkpoint()
+
+    def test_fit_observes_only_new_training_rollouts_and_finishes_before_checkpoint(self):
+        path = ROOT / "verl/trainer/ppo/ray_trainer.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        trainer = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RayPPOTrainer")
+        fit = next(node for node in trainer.body if getattr(node, "name", None) == "fit")
+        calls = [node for node in ast.walk(fit) if isinstance(node, ast.Call)]
+        observes = [node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "observe"]
+        self.assertEqual(len(observes), 1)
+        by_name = {node.func.attr: node.lineno for node in calls if isinstance(node.func, ast.Attribute)}
+        self.assertLess(by_name["_generate_training_rollouts"], observes[0].lineno)
+        self.assertLess(observes[0].lineno, by_name["update_actor"])
+        self.assertLess(by_name["_finish_failure_epoch"], by_name["_save_checkpoint"])
+        self.assertLess(by_name["_finish_failure_epoch"], by_name["log"])
 
 
 class TestInMemoryOpenAIServing(unittest.TestCase):

@@ -1,4 +1,4 @@
-"""Compare exact policy-loss gradients, either paired in memory or across runs.
+"""Compare independent optimization trajectories and legacy policy gradients.
 
 Run from the existing verl environment::
 
@@ -6,13 +6,14 @@ Run from the existing verl environment::
         --supervised /path/to/supervised/gradients \
         --unsupervised /path/to/ttrl/gradients --output /path/to/diagnosis
 
-Each optimizer minibatch is a snapshot. Rank shards are stored as float32 binary
-arrays with JSON metadata; comparisons stream the arrays rather than gathering
-the full model or averaging per-rank cosine similarities.
+Legacy full mode stores each selected optimizer minibatch's rank shards as
+float32 binary arrays with JSON metadata. Offline comparisons stream those
+arrays rather than gathering the full model or averaging per-rank cosines.
 
-Paired mode holds one gradient in CPU memory and writes global statistics,
-including optional random-direction and shuffled-label references. An opt-in
-supervised optimizer branch additionally compares actual multi-step paths.
+Paired trajectories compare actual optimizer paths against an independent
+supervised branch, optionally with shuffled-label and geometric random-update
+baselines sharing the same reference and origin. Legacy single-step paired
+diagnostics retain exact full-coordinate gradients only in CPU memory.
 Export its records with ``--paired /path/to/gradients --output /path/to/diagnosis``.
 """
 
@@ -92,7 +93,11 @@ def recording_due(config, step):
 
 
 def paired_recording_due(config, step):
-    return config.get("mode", "full") == "paired" and recording_due(config, step)
+    return (
+        config.get("mode", "full") == "paired"
+        and config.get("single_step", {}).get("enabled", True)
+        and recording_due(config, step)
+    )
 
 
 def validate_gradient_recording(config):
@@ -112,6 +117,8 @@ def validate_gradient_recording(config):
     trajectory = record.get("trajectory", {}).get("enabled", False)
     if trajectory and (mode != "paired" or actor.strategy != "fsdp"):
         raise ValueError("Optimization trajectory diagnostics require mode=paired and strategy=fsdp (FSDP1)")
+    if mode == "paired" and not trajectory and not record.get("single_step", {}).get("enabled", True):
+        raise ValueError("Paired diagnostics require trajectory.enabled=True or single_step.enabled=True")
     seed = record.get("baselines", {}).get("seed", 0)
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError("gradient_record.baselines.seed must be a non-negative integer")
@@ -427,15 +434,20 @@ def _restore_state(value):
 
 
 class OptimizationTrajectory:
-    """Two independent optimizer paths driven by the same recorded rollouts.
+    """Independent optimizer branches with one shared origin and live snapshot.
 
-    The supervised branch keeps its own parameters, buffers and optimizer
-    history on CPU. A temporary swap reuses the actor and training optimizer;
-    no gradient is evaluated at the other branch's parameters after divergence.
-    FSDP1 local shards are sufficient; no full model gather is performed.
+    Optional references comprise a shuffled-label optimizer branch and a
+    geometric random-update path, whose intended global step L2 matches TTRL.
+    The latter has no optimizer: its FP32 displacement is accumulated directly.
+    FSDP1 local shards suffice; no model or update vector is gathered.
     """
 
-    def __init__(self, module, optimizer):
+    def __init__(self, module, optimizer, *, baselines=False, seed=0):
+        diagnostic_seed(seed)
+        if seed < 0:
+            raise ValueError("Optimization trajectory seed must be non-negative")
+        self.baselines = bool(baselines)
+        self.seed = int(seed)
         self.layouts = [_parameter_layout(name, parameter) for name, parameter in module.named_parameters()
                         if parameter.requires_grad]
         self.initial_parameters = self._parameters(module)
@@ -447,6 +459,17 @@ class OptimizationTrajectory:
         self.updates = 0
         self.path_statistics = torch.zeros(3, dtype=torch.float64)
         self.start_update = None
+        if self.baselines:
+            # Initial values are immutable CPU snapshots, shared by reference.
+            # Each branch receives its own values only after its first update.
+            self.shuffled_parameters = self.initial_parameters
+            self.shuffled_buffers = self.supervised_buffers
+            self.shuffled_optimizer_state = self.supervised_optimizer_state
+            self.random_displacement = [torch.zeros_like(value, dtype=torch.float32)
+                                        for value in self.initial_parameters]
+            self.baseline_path_statistics = {
+                name: torch.zeros(3, dtype=torch.float64) for name in ("shuffled_labels", "random_update")
+            }
 
     def _parameters(self, module):
         parameters = [(name, p) for name, p in module.named_parameters() if p.requires_grad]
@@ -474,52 +497,89 @@ class OptimizationTrajectory:
             for name, value in buffers.items():
                 current_buffers[name].copy_(value)
 
-    def supervised_step(self, module, optimizer, callback):
-        """Run one supervised optimizer step and always restore the live branch.
+    @staticmethod
+    def _restore_groups(optimizer, groups):
+        for group, original in zip(optimizer.param_groups, groups):
+            for key in list(group):
+                if key != "params":
+                    del group[key]
+            group.update(copy.deepcopy(original))
 
-        The caller forks RNG so the two branches share the stochastic masks.
-        Current param_groups (especially scheduler-controlled LR) are shared;
-        the independently evolving optimizer *state* is swapped, not the LR.
+    def supervised_step(
+        self, module, optimizer, callback, *, shuffled_callback=None, rank=0, world_size=1, device=None
+    ):
+        """Advance shadow branches transactionally, preserving live state/RNG.
+
+        Both callbacks start at the same RNG state and current param-group
+        settings, including the live scheduler's LR. Parameters, buffers and
+        Adam history evolve independently. The live branch is copied only once;
+        failure in either callback commits neither shadow branch.
         """
         if self.pending is not None:
             raise ValueError("The preceding real optimizer step has not been recorded")
+        if self.baselines != (shuffled_callback is not None):
+            raise ValueError("Trajectory baselines require exactly one shuffled-label update callback")
         live_parameters = self._parameters(module)
         live_buffers = self._buffers(module)
         live_state = _snapshot_state(optimizer.state)
         groups = [{key: copy.deepcopy(value) for key, value in group.items() if key != "params"}
                   for group in optimizer.param_groups]
         previous_supervised = self.supervised_parameters
+        previous_shuffled = self.shuffled_parameters if self.baselines else None
+        branches = [(callback, self.supervised_parameters, self.supervised_buffers, self.supervised_optimizer_state)]
+        if self.baselines:
+            branches.append((shuffled_callback, self.shuffled_parameters,
+                             self.shuffled_buffers, self.shuffled_optimizer_state))
+        updated = []
+        live_devices = {parameter.device for parameter in module.parameters() if parameter.device.type != "cpu"}
+        device_type = next(iter(live_devices)).type if live_devices else "cuda"
+        devices = sorted({item.index for item in live_devices})
         try:
-            optimizer.zero_grad()
-            self._load(module, self.supervised_parameters, self.supervised_buffers)
-            optimizer.state.clear()
-            optimizer.state = _restore_state(self.supervised_optimizer_state)
-            callback()
-            parameters = self._parameters(module)
-            buffers = self._buffers(module)
-            state = _snapshot_state(optimizer.state)
+            for update, parameters, buffers, state in branches:
+                optimizer.zero_grad()
+                self._load(module, parameters, buffers)
+                optimizer.state.clear()
+                optimizer.state = _restore_state(state)
+                self._restore_groups(optimizer, groups)
+                with torch.random.fork_rng(devices=devices, device_type=device_type):
+                    update()
+                updated.append((self._parameters(module), self._buffers(module), _snapshot_state(optimizer.state)))
         finally:
             optimizer.zero_grad()
             self._load(module, live_parameters, live_buffers)
             optimizer.state.clear()
             optimizer.state = _restore_state(live_state)
-            for group, original in zip(optimizer.param_groups, groups):
-                for key in list(group):
-                    if key != "params":
-                        del group[key]
-                group.update(original)
-        self.supervised_parameters = parameters
-        self.supervised_buffers = buffers
-        self.supervised_optimizer_state = state
-        self.pending = (live_parameters, previous_supervised)
+            self._restore_groups(optimizer, groups)
+        self.supervised_parameters, self.supervised_buffers, self.supervised_optimizer_state = updated[0]
+        if self.baselines:
+            self.shuffled_parameters, self.shuffled_buffers, self.shuffled_optimizer_state = updated[1]
+        self.pending = (live_parameters, previous_supervised, previous_shuffled)
+
+    def _random_chunks(self, key, rank):
+        """Use fixed blocks and rank-separated CPU RNG, independent of IO chunks."""
+        for index, layout in enumerate(self.layouts):
+            for start in range(0, layout["numel"], RANDOM_BLOCK_SIZE):
+                size = min(RANDOM_BLOCK_SIZE, layout["numel"] - start)
+                generator = torch.Generator(device="cpu")
+                generator.manual_seed(diagnostic_seed(
+                    self.seed, "trajectory_random_update", key, rank, index, start // RANDOM_BLOCK_SIZE
+                ))
+                yield index, start, torch.randn(size, generator=generator, dtype=torch.float64)
+
+    @staticmethod
+    def _add_statistics(statistics, left, right):
+        statistics += torch.stack((torch.dot(left, right), torch.dot(left, left), torch.dot(right, right)))
 
     def finish_step(self, module, metadata, *, rank=0, world_size=1, device=None):
         """Compare actual endpoint displacements and concatenated step deltas."""
         if self.pending is None:
             raise ValueError("A supervised optimizer step is required before the real step")
-        live_before, supervised_before = self.pending
+        live_before, supervised_before, shuffled_before = self.pending
         endpoint = torch.zeros(3, dtype=torch.float64)
         increment = torch.zeros(3, dtype=torch.float64)
+        baseline_endpoints = {name: torch.zeros(3, dtype=torch.float64)
+                              for name in self.baseline_path_statistics} if self.baselines else {}
+        baseline_increments = {name: torch.zeros(3, dtype=torch.float64) for name in baseline_endpoints}
         parameters = [(name, p) for name, p in module.named_parameters() if p.requires_grad]
         if [_parameter_layout(name, p) for name, p in parameters] != self.layouts:
             raise ValueError("Optimization trajectory parameter layouts changed")
@@ -534,22 +594,68 @@ class OptimizationTrajectory:
                 y = current.double() - origin[start:stop].double()
                 dx = supervised[start:stop].double() - previous_s[start:stop].double()
                 dy = current.double() - previous_u[start:stop].double()
-                endpoint += torch.stack((torch.dot(x, y), torch.dot(x, x), torch.dot(y, y)))
-                increment += torch.stack((torch.dot(dx, dy), torch.dot(dx, dx), torch.dot(dy, dy)))
+                self._add_statistics(endpoint, x, y)
+                self._add_statistics(increment, dx, dy)
+                if self.baselines:
+                    shuffled = self.shuffled_parameters[index].reshape(-1)[start:stop].double()
+                    previous = shuffled_before[index].reshape(-1)[start:stop].double()
+                    self._add_statistics(baseline_endpoints["shuffled_labels"], x,
+                                         shuffled - origin[start:stop].double())
+                    self._add_statistics(baseline_increments["shuffled_labels"], dx, shuffled - previous)
         if not torch.isfinite(endpoint).all() or not torch.isfinite(increment).all():
             raise ValueError("Non-finite optimization trajectory statistics")
+        key = f"step_{metadata['step']:06d}_epoch_{metadata['epoch']:03d}_minibatch_{metadata['minibatch']:04d}"
+        random_norms = None
+        if self.baselines:
+            # The first collective defines a single full-coordinate scale.
+            # Per-rank normalization would bias the global random direction.
+            norms = torch.zeros(2, dtype=torch.float64)
+            norms[0] = increment[2]
+            for _, _, random in self._random_chunks(key, rank):
+                norms[1] += torch.dot(random, random)
+            norms = norms.to("cpu" if device is None else device)
+            if world_size > 1:
+                torch.distributed.all_reduce(norms, op=torch.distributed.ReduceOp.SUM)
+            target_sq, gaussian_sq = norms.cpu().tolist()
+            if not all(math.isfinite(value) and value >= 0 for value in (target_sq, gaussian_sq)):
+                raise ValueError("Non-finite random update normalization")
+            scale = math.sqrt(target_sq / gaussian_sq) if gaussian_sq > 0 else 0.0
+            if target_sq > 0 and gaussian_sq == 0:
+                raise ValueError("A nonzero TTRL update requires a nonzero random direction")
+            applied_sq = torch.zeros((), dtype=torch.float64)
+            for index, start, random in self._random_chunks(key, rank):
+                stop = start + random.numel()
+                displacement = self.random_displacement[index].reshape(-1)[start:stop]
+                previous = displacement.double()
+                displacement.add_((random * scale).float())
+                applied = displacement.double() - previous
+                supervised = self.supervised_parameters[index].reshape(-1)[start:stop].double()
+                origin = self.initial_parameters[index].reshape(-1)[start:stop].double()
+                previous_s = supervised_before[index].reshape(-1)[start:stop].double()
+                self._add_statistics(baseline_endpoints["random_update"], supervised - origin, displacement.double())
+                self._add_statistics(baseline_increments["random_update"], supervised - previous_s, applied)
+                applied_sq += torch.dot(applied, applied)
+            random_norms = (target_sq, applied_sq)
         self.path_statistics += increment
         self.updates += 1
-        key = f"step_{metadata['step']:06d}_epoch_{metadata['epoch']:03d}_minibatch_{metadata['minibatch']:04d}"
         if self.start_update is None:
             self.start_update = key
-        values = torch.cat((endpoint, self.path_statistics)).to("cpu" if device is None else device)
+        pieces = [endpoint, self.path_statistics]
+        for name in baseline_endpoints:
+            self.baseline_path_statistics[name] += baseline_increments[name]
+            pieces.extend((baseline_endpoints[name], self.baseline_path_statistics[name]))
+        if self.baselines:
+            pieces.append(random_norms[1].reshape(1))
+        values = torch.cat(pieces)
+        if not torch.isfinite(values).all():
+            raise ValueError("Non-finite optimization trajectory statistics")
+        values = values.to("cpu" if device is None else device)
         if world_size > 1:
             torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
         values = values.cpu().tolist()
         self.pending = None
-        return {
-            "version": 1,
+        result = {
+            "version": 2 if self.baselines else 1,
             "mode": "optimization_trajectory",
             "reference": "independent_supervised_grpo_parameters_and_optimizer_state",
             "data": "shared_ttrl_rollouts_and_old_log_probs",
@@ -564,8 +670,39 @@ class OptimizationTrajectory:
             "world_size": world_size,
             "origin_parameter_fingerprint_local": self.origin_fingerprint,
             "endpoint": _comparison_statistics(*values[:3]),
-            "path": _comparison_statistics(*values[3:]),
+            "path": _comparison_statistics(*values[3:6]),
         }
+        # Preserve the legacy top-level U-vs-S fields and reuse the same S
+        # reference for both baselines, rather than comparing U with noise.
+        if self.baselines:
+            result["baselines"] = {}
+            for index, name in enumerate(baseline_endpoints):
+                offset = 6 + 6 * index
+                result["baselines"][name] = {
+                    "reference": "same_independent_supervised_optimizer_trajectory",
+                    "endpoint": _comparison_statistics(*values[offset:offset + 3]),
+                    "path": _comparison_statistics(*values[offset + 3:offset + 6]),
+                }
+            target = math.sqrt(random_norms[0])
+            applied = math.sqrt(values[-1])
+            result["baselines"]["shuffled_labels"]["update_rule"] = "independent_training_optimizer_and_history"
+            result["baselines"]["random_update"].update({
+                "update_rule": "isotropic_gaussian_displacement_without_optimizer",
+                "step_norm_target": "ttrl_actual_global_step_l2_before_float32_accumulation_rounding",
+                "target_step_norm": target,
+                "applied_step_norm": applied,
+                "step_norm_relative_error": abs(applied - target) / target if target else 0.0,
+                "endpoint_accumulation_dtype": "float32",
+                "path_increment": "actual_difference_of_float32_cumulative_displacement",
+                "rounding": "float32_accumulation_can_change_step_norm_especially_for_tiny_updates",
+            })
+            result["baseline_metadata"] = {
+                "seed": self.seed, "draws_per_update": 1,
+                "reference": "same_independent_supervised_optimizer_trajectory",
+                "random_coordinates": "all_trainable_coordinates_with_global_norm_and_rank_separated_cpu_rng",
+                "statistics_accumulation_dtype": "float64",
+            }
+        return result
 
 
 def save_trajectory_statistics(result, directory, *, rank=0):
@@ -768,7 +905,7 @@ def _export_trajectories(directory, output):
     rows = []
     for path in sorted(Path(directory).glob("trajectory_step_*_epoch_*_minibatch_*.json")):
         record = json.loads(path.read_text(encoding="utf-8"))
-        if record.get("version") != 1 or record.get("mode") != "optimization_trajectory":
+        if record.get("version") not in (1, 2) or record.get("mode") != "optimization_trajectory":
             raise ValueError(f"Unsupported optimization trajectory record: {path}")
         keys = ("update", "step", "epoch", "minibatch", "updates", "start_update", "end_update")
         row = {key: record[key] for key in keys}
@@ -779,6 +916,20 @@ def _export_trajectories(directory, output):
                 comparison["unsupervised_squared_norm"],
             )
             row.update({f"{name}_{field}": statistics[field] for field in statistics})
+        for baseline, comparisons in record.get("baselines", {}).items():
+            for name in ("endpoint", "path"):
+                comparison = comparisons[name]
+                statistics = _comparison_statistics(
+                    comparison["dot_product"], comparison["supervised_squared_norm"],
+                    comparison["unsupervised_squared_norm"],
+                )
+                row.update({f"{baseline}_{name}_{field}": statistics[field] for field in statistics})
+        if record.get("baseline_metadata"):
+            row["baseline_seed"] = record["baseline_metadata"].get("seed")
+        random = record.get("baselines", {}).get("random_update", {})
+        for name in ("target_step_norm", "applied_step_norm", "step_norm_relative_error"):
+            if name in random:
+                row[f"random_update_{name}"] = random[name]
         rows.append(row)
     if not rows:
         return None
@@ -786,7 +937,7 @@ def _export_trajectories(directory, output):
     destination.mkdir(parents=True, exist_ok=True)
     csv_path = destination / "trajectory_comparison.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(stream, fieldnames=list(dict.fromkeys(key for row in rows for key in row)))
         writer.writeheader()
         writer.writerows(rows)
     import matplotlib
@@ -794,30 +945,47 @@ def _export_trajectories(directory, output):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    figure, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    figure, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
     # A resumed run starts a new independently initialized trajectory segment.
     segments = dict.fromkeys(row["start_update"] for row in rows)
     for segment in segments:
         positions = [i for i, row in enumerate(rows) if row["start_update"] == segment]
-        for name, label in (("endpoint", "Endpoint displacement"), ("path", "Concatenated update increments")):
-            values = [rows[i][f"{name}_cosine"] for i in positions]
-            axes[0].plot(
-                positions, [np.nan if value is None else value for value in values], ".-", label=f"{label} ({segment})"
+        suffix = f" ({segment})" if len(segments) > 1 else ""
+        targets = (("", "TTRL", "C0"), ("shuffled_labels_", "Shuffled labels", "C1"),
+                   ("random_update_", "Random update", "C2"))
+        for prefix, label, color in targets:
+            for index, name in enumerate(("endpoint", "path")):
+                field = f"{prefix}{name}_cosine"
+                if not any(field in rows[i] for i in positions):
+                    continue
+                values = [rows[i].get(field) for i in positions]
+                axes[index].plot(
+                    positions, [np.nan if value is None else value for value in values], ".-",
+                    label=f"{label}{suffix}", color=color,
+                )
+        norm_fields = (("endpoint_supervised_norm", "Supervised", "C3"),
+                       ("endpoint_unsupervised_norm", "TTRL", "C0"),
+                       ("shuffled_labels_endpoint_unsupervised_norm", "Shuffled labels", "C1"),
+                       ("random_update_endpoint_unsupervised_norm", "Random update", "C2"))
+        for field, label, color in norm_fields:
+            if not any(field in rows[i] for i in positions):
+                continue
+            values = [rows[i].get(field) for i in positions]
+            axes[2].plot(
+                positions, [np.nan if value is None else value for value in values], ".-",
+                label=f"{label}{suffix}", color=color,
             )
-        for name, label in (("supervised_norm", "Supervised"), ("unsupervised_norm", "TTRL")):
-            axes[1].plot(
-                positions, [rows[i][f"endpoint_{name}"] for i in positions], ".-", label=f"{label} ({segment})"
-            )
-    axes[0].axhline(0, color="gray", linewidth=0.8)
-    axes[0].set_ylim(-1.05, 1.05)
-    axes[0].set_ylabel("Cosine similarity")
-    axes[1].set_ylabel("Endpoint displacement L2 norm")
+    for axis, label in zip(axes[:2], ("Endpoint cosine", "Update-path cosine")):
+        axis.axhline(0, color="gray", linewidth=0.8)
+        axis.set_ylim(-1.05, 1.05)
+        axis.set_ylabel(label)
+    axes[2].set_ylabel("Endpoint displacement L2 norm")
     for axis in axes:
         axis.legend(fontsize=7)
     ticks = np.unique(np.linspace(0, len(rows) - 1, min(6, len(rows)), dtype=int))
-    axes[1].set_xticks(ticks, [str(rows[i]["updates"]) for i in ticks])
-    axes[1].set_xlabel("Optimizer minibatches since the segment's common start")
-    figure.suptitle("Independent optimizer paths (shared TTRL rollouts)")
+    axes[2].set_xticks(ticks, [str(rows[i]["updates"]) for i in ticks])
+    axes[2].set_xlabel("Optimizer minibatches since the segment's common start")
+    figure.suptitle("Optimization trajectories against a common supervised reference")
     figure.tight_layout()
     figure.savefig(destination / "trajectory_comparison.png", dpi=160)
     plt.close(figure)

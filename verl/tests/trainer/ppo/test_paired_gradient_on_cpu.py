@@ -90,7 +90,10 @@ class TestPairedGradientTrainer(unittest.TestCase):
         modules.start()
         self.addCleanup(modules.stop)
 
-    def trainer(self, *, enabled=True, mode="paired", step=1, warmup=0, baselines=False, seed=0, trajectory=False):
+    def trainer(
+        self, *, enabled=True, mode="paired", step=1, warmup=0, baselines=False, seed=0,
+        trajectory=False, single_step=None,
+    ):
         trainer = Trainer()
         trainer.config = Config(
             actor_rollout_ref=Config(
@@ -109,6 +112,8 @@ class TestPairedGradientTrainer(unittest.TestCase):
             trainer.config.actor_rollout_ref.actor.gradient_record["baselines"] = Config(enabled=True, seed=seed)
         if trajectory:
             trainer.config.actor_rollout_ref.actor.gradient_record["trajectory"] = Config(enabled=True)
+        if single_step is not None:
+            trainer.config.actor_rollout_ref.actor.gradient_record["single_step"] = Config(enabled=single_step)
         return trainer
 
     def batch(self):
@@ -234,12 +239,35 @@ class TestPairedGradientTrainer(unittest.TestCase):
         self.assertFalse(self.trainer(step=2, enabled=False, trajectory=True)._paired_gradient_due())
         self.assertFalse(self.trainer(step=2, mode="full", trajectory=True)._paired_gradient_due())
 
+    def test_trajectory_prepares_both_labels_when_legacy_single_step_is_disabled(self):
+        trainer = self.trainer(step=2, trajectory=True, baselines=True, single_step=False)
+        batch = self.batch()
+        self.assertTrue(trainer._paired_gradient_due())
+        trainer._prepare_paired_gradient_advantages(batch)
+        self.oracle.assert_called_once_with(batch)
+        self.assertIn("diagnostic_supervised_advantages", batch.batch)
+        self.assertIn("diagnostic_shuffled_advantages", batch.batch)
+        self.assertIn("gradient_baselines", batch.meta_info)
+        self.assertFalse(diagnostics.paired_recording_due(trainer.config.actor_rollout_ref.actor.gradient_record, 2))
+
+    def test_single_step_switch_preserves_legacy_default_and_skips_disabled_oracle(self):
+        for step in (1, 10):
+            self.assertTrue(self.trainer(step=step)._paired_gradient_due())
+            self.assertTrue(self.trainer(step=step, single_step=True)._paired_gradient_due())
+            trainer, batch = self.trainer(step=step, single_step=False), self.batch()
+            self.assertFalse(trainer._paired_gradient_due())
+            trainer._prepare_paired_gradient_advantages(batch)
+            self.assertNotIn("diagnostic_supervised_advantages", batch.batch)
+        self.oracle.assert_not_called()
+
     def test_only_selected_rollouts_record_trace_without_forwarding_answers(self):
         for options, trace_expected in (
             ({"step": 1}, True),
             ({"step": 10}, True),
             ({"step": 2}, False),
             ({"step": 2, "trajectory": True}, True),
+            ({"step": 2, "trajectory": True, "single_step": False}, True),
+            ({"step": 1, "single_step": False}, False),
             ({"enabled": False}, False),
             ({"mode": "full"}, False),
         ):

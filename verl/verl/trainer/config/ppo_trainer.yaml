@@ -22,6 +22,13 @@ failure_mode_detection:
     # Upper bound for the USER-turn average diagnostic utility.
     max_weight: 2.0
 
+    # Optional epoch-level updates using per-type rollout occurrence rates.
+    # The first epoch uses type_weights; later weights are 1 + (max_weight - 1) * rate.
+    epoch_frequency:
+
+      # Requires diagnostics, advantage weighting, and complete training epochs.
+      enabled: false
+
     # Local heuristic utilities, not SEAL's original label mapping.
     # One dominant type per processed user turn; no detected event has utility 1.
     type_weights:
@@ -206,27 +213,33 @@ actor_rollout_ref:
     # Gradient clipping for actor updates
     grad_clip: 1.0
 
-    # Optional exact policy-gradient diagnosis, before regularizers and gradient clipping.
+    # Optional update-trajectory diagnostics and legacy pure policy gradients.
     gradient_record:
 
-      # The BFCL-Agent experiment commands enable this by default.
+      # Enabled explicitly by the BFCL diagnostic command (manual step 6B).
       enabled: false
 
-      # full: legacy FP32 gradient files; paired: same-rollout BFCL/TTRL statistics only.
+      # full: legacy FP32 gradient files; paired: shared-rollout trajectory/statistics JSON.
       mode: full
 
-      # Same-point paired null references; no changes to the actual update.
+      # Legacy same-point policy gradients are opt-in for new configurations.
+      # Configurations without this field keep their previous snapshot behavior.
+      single_step:
+        enabled: false
+
+      # Random directions and shuffled labels, including independent update paths.
       baselines:
         enabled: true
         seed: 0
 
-      # Independent supervised optimizer branch sharing the TTRL rollouts.
+      # Independent supervised and optional shuffled-label optimizer branches.
+      # Gaussian update paths match each real TTRL step's global L2 norm.
       # CPU parameter/optimizer snapshots are expensive; FSDP1 only.
       # When enabled, score and advance EVERY minibatch; interval only controls output.
       trajectory:
         enabled: false
 
-      # Derived from the run directory; only enabled is needed to toggle recording.
+      # Derived from the run directory; paired needs trajectory or single_step enabled.
       # All ranks share this directory on multi-GPU jobs.
       output_dir: ${trainer.default_local_dir}/gradients
 

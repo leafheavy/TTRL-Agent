@@ -1,5 +1,6 @@
 """CPU checks for full-coordinate paired gradients without binary snapshots."""
 
+import copy
 import csv
 import importlib.util
 import json
@@ -419,6 +420,350 @@ class TestTrajectoryExportAndConfiguration(unittest.TestCase):
         config = configuration()
         config.actor_rollout_ref.actor.gradient_record["trajectory"] = {"enabled": True}
         diagnostics.validate_gradient_recording(config)
+
+
+class TestTrajectoryRandomBaselines(unittest.TestCase):
+    @staticmethod
+    def flatten(module):
+        return torch.cat([parameter.detach().reshape(-1).double() for parameter in module.parameters()])
+
+    @staticmethod
+    def random_displacement(trajectory):
+        return torch.cat([value.reshape(-1).double() for value in trajectory.random_displacement])
+
+    def assert_state_equal(self, left, right):
+        if isinstance(left, torch.Tensor):
+            self.assertTrue(torch.equal(left, right))
+        elif isinstance(left, dict):
+            self.assertEqual(left.keys(), right.keys())
+            for key in left:
+                self.assert_state_equal(left[key], right[key])
+        elif isinstance(left, (tuple, list)):
+            self.assertEqual(len(left), len(right))
+            for a, b in zip(left, right):
+                self.assert_state_equal(a, b)
+        else:
+            self.assertEqual(left, right)
+
+    @staticmethod
+    def optimizer(module):
+        return torch.optim.AdamW(module.parameters(), lr=0.02, betas=(0.7, 0.85), weight_decay=0.13)
+
+    @staticmethod
+    def update(module, optimizer, target):
+        inputs = torch.tensor([[1.0, -0.5], [0.2, 0.8], [-0.7, 1.1]], dtype=torch.float64)
+        optimizer.zero_grad()
+        module.num_forwards.add_(1)
+        loss = (module(inputs) - target).square().mean()
+        loss += 0.07 * sum(parameter.square().sum() for parameter in module.parameters())
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(module.parameters(), 0.15)
+        optimizer.step()
+
+    def assert_comparison(self, actual, left, right):
+        expected = diagnostics._comparison_statistics(
+            torch.dot(left, right).item(), torch.dot(left, left).item(), torch.dot(right, right).item()
+        )
+        self.assertEqual(actual["status"], expected["status"])
+        for key, value in expected.items():
+            if isinstance(value, float):
+                self.assertAlmostEqual(actual[key], value, places=12)
+            else:
+                self.assertEqual(actual[key], value)
+
+    def test_three_optimizer_paths_match_adamw_oracles_and_random_actual_increments(self):
+        torch.manual_seed(31)
+        module = nn.Sequential(nn.Linear(2, 3, dtype=torch.float64), nn.Dropout(0.35),
+                               nn.Linear(3, 1, dtype=torch.float64))
+        module.register_buffer("num_forwards", torch.zeros((), dtype=torch.long))
+        optimizer = self.optimizer(module)
+        self.update(module, optimizer, torch.zeros(3, 1, dtype=torch.float64))
+        origin = self.flatten(module)
+        references = [copy.deepcopy(module) for _ in range(3)]
+        reference_optimizers = [self.optimizer(item) for item in references]
+        for reference_optimizer in reference_optimizers:
+            reference_optimizer.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+        supervised, shuffled, unsupervised = references
+        supervised_optimizer, shuffled_optimizer, unsupervised_optimizer = reference_optimizers
+        trajectory = diagnostics.OptimizationTrajectory(module, optimizer, baselines=True, seed=17)
+        self.assertIs(trajectory.supervised_parameters, trajectory.initial_parameters)
+        self.assertIs(trajectory.shuffled_parameters, trajectory.initial_parameters)
+        self.assertIs(trajectory.supervised_optimizer_state, trajectory.shuffled_optimizer_state)
+        increments = {name: [] for name in ("supervised", "shuffled_labels", "unsupervised", "random_update")}
+
+        for step, learning_rate in enumerate((0.02, 0.007, 0.011), start=1):
+            for item in (optimizer, *reference_optimizers):
+                item.param_groups[0]["lr"] = learning_rate
+            targets = [torch.tensor([[0.9], [-0.4], [0.3]], dtype=torch.float64) * step,
+                       torch.tensor([[-0.4], [0.3], [0.9]], dtype=torch.float64) * step,
+                       torch.tensor([[-0.7], [0.5], [-0.1]], dtype=torch.float64) / step]
+            supervised_target, shuffled_target, unsupervised_target = targets
+            before = [self.flatten(item) for item in references]
+            random_before = self.random_displacement(trajectory)
+            torch.manual_seed(100 + step)
+            rng = torch.random.get_rng_state().clone()
+            for reference, reference_optimizer, target in zip(references[:2], reference_optimizers[:2], targets[:2]):
+                with torch.random.fork_rng(devices=[]):
+                    self.update(reference, reference_optimizer, target)
+            live_state = copy.deepcopy(module.state_dict())
+            live_optimizer_state = copy.deepcopy(optimizer.state_dict())
+
+            def supervised_update(target=supervised_target):
+                self.update(module, optimizer, target)
+                self.assert_state_equal(module.state_dict(), supervised.state_dict())
+                self.assert_state_equal(optimizer.state_dict(), supervised_optimizer.state_dict())
+
+            def shuffled_update(target=shuffled_target):
+                self.update(module, optimizer, target)
+                self.assert_state_equal(module.state_dict(), shuffled.state_dict())
+                self.assert_state_equal(optimizer.state_dict(), shuffled_optimizer.state_dict())
+
+            with patch.object(trajectory, "_parameters", wraps=trajectory._parameters) as snapshot:
+                trajectory.supervised_step(module, optimizer, supervised_update, shuffled_callback=shuffled_update)
+            self.assertEqual(snapshot.call_count, 3)  # One live snapshot, one new snapshot per shadow branch.
+            self.assert_state_equal(module.state_dict(), live_state)
+            self.assert_state_equal(optimizer.state_dict(), live_optimizer_state)
+            self.assertTrue(torch.equal(torch.random.get_rng_state(), rng))
+            self.assertTrue(all(parameter.grad is None for parameter in module.parameters()))
+            self.update(module, optimizer, unsupervised_target)
+            with torch.random.fork_rng(devices=[]):
+                torch.random.set_rng_state(rng)
+                self.update(unsupervised, unsupervised_optimizer, unsupervised_target)
+            self.assert_state_equal(module.state_dict(), unsupervised.state_dict())
+            self.assert_state_equal(optimizer.state_dict(), unsupervised_optimizer.state_dict())
+            rng_after_real_update = torch.random.get_rng_state().clone()
+            record = trajectory.finish_step(module, {"step": step, "epoch": 0, "minibatch": 0})
+            self.assertTrue(torch.equal(torch.random.get_rng_state(), rng_after_real_update))
+            self.assertEqual(record["version"], 2)
+            self.assertEqual(record["updates"], step)
+            for name, reference, previous in zip(
+                ("supervised", "shuffled_labels", "unsupervised"), references, before
+            ):
+                increments[name].append(self.flatten(reference) - previous)
+            random_after = self.random_displacement(trajectory)
+            increments["random_update"].append(random_after - random_before)
+            for name, endpoint, comparison in (
+                ("unsupervised", self.flatten(unsupervised) - origin, record),
+                ("shuffled_labels", self.flatten(shuffled) - origin, record["baselines"]["shuffled_labels"]),
+                ("random_update", random_after, record["baselines"]["random_update"]),
+            ):
+                self.assert_comparison(comparison["endpoint"], self.flatten(supervised) - origin, endpoint)
+                self.assert_comparison(comparison["path"], torch.cat(increments["supervised"]),
+                                       torch.cat(increments[name]))
+            random = record["baselines"]["random_update"]
+            self.assertAlmostEqual(random["target_step_norm"], increments["unsupervised"][-1].norm().item())
+            self.assertAlmostEqual(random["applied_step_norm"], increments["random_update"][-1].norm().item())
+            self.assertLess(random["step_norm_relative_error"], 1e-5)
+            self.assertIn("without_optimizer", random["update_rule"])
+
+    def test_second_shadow_failure_restores_live_state_rng_lr_and_both_shadow_histories(self):
+        module = nn.Linear(2, 1, dtype=torch.float64)
+        module.register_buffer("num_forwards", torch.zeros((), dtype=torch.long))
+        optimizer = self.optimizer(module)
+        self.update(module, optimizer, torch.zeros(3, 1, dtype=torch.float64))
+        trajectory = diagnostics.OptimizationTrajectory(module, optimizer, baselines=True)
+        original = copy.deepcopy(module.state_dict())
+        optimizer_before = copy.deepcopy(optimizer.state_dict())
+        supervised_before = trajectory.supervised_parameters
+        shuffled_before = trajectory.shuffled_parameters
+        rng = torch.random.get_rng_state().clone()
+
+        def supervised_update():
+            self.update(module, optimizer, torch.ones(3, 1, dtype=torch.float64))
+
+        def failing_shuffle():
+            self.update(module, optimizer, -torch.ones(3, 1, dtype=torch.float64))
+            optimizer.param_groups[0]["lr"] = 7
+            torch.rand(4)
+            raise RuntimeError("shuffled update failed")
+
+        with self.assertRaisesRegex(RuntimeError, "shuffled update failed"):
+            trajectory.supervised_step(module, optimizer, supervised_update, shuffled_callback=failing_shuffle)
+        self.assert_state_equal(module.state_dict(), original)
+        self.assert_state_equal(optimizer.state_dict(), optimizer_before)
+        self.assertIs(trajectory.supervised_parameters, supervised_before)
+        self.assertIs(trajectory.shuffled_parameters, shuffled_before)
+        self.assertIsNone(trajectory.pending)
+        self.assertTrue(torch.equal(torch.random.get_rng_state(), rng))
+        self.assertTrue(all(parameter.grad is None for parameter in module.parameters()))
+
+    def test_global_random_norm_and_all_baseline_statistics_reduce_shards(self):
+        def statistics(left, right):
+            return torch.tensor([torch.dot(left, right), torch.dot(left, left), torch.dot(right, right)],
+                                dtype=torch.float64)
+
+        scale = math.sqrt(25 / 10)
+        supervised = [torch.tensor([1., 0.]), torch.tensor([0., 2.])]
+        unsupervised = [torch.tensor([3., 0.]), torch.tensor([0., 4.])]
+        shuffled = [torch.tensor([0., 1.]), torch.tensor([2., 0.])]
+        gaussian = [torch.tensor([1., 2.]), torch.tensor([2., -1.])]
+        random = [(value.double() * scale).float().double() for value in gaussian]
+        local_statistics = []
+        for rank in range(2):
+            pieces = []
+            for target in (unsupervised[rank].double(), shuffled[rank].double(), random[rank]):
+                values = statistics(supervised[rank].double(), target)
+                pieces.extend((values, values))
+            local_statistics.append(torch.cat((*pieces, random[rank].square().sum().reshape(1))))
+        expected = local_statistics[0] + local_statistics[1]
+        for rank in range(2):
+            module = nn.Linear(2, 1, bias=False, dtype=torch.float64)
+            with torch.no_grad():
+                module.weight.zero_()
+            optimizer = torch.optim.AdamW(module.parameters())
+            trajectory = diagnostics.OptimizationTrajectory(module, optimizer, baselines=True)
+
+            def add(values, module=module):
+                with torch.no_grad():
+                    module.weight.add_(values.double().reshape(1, 2))
+
+            trajectory.supervised_step(module, optimizer, lambda rank=rank: add(supervised[rank]),
+                                       shuffled_callback=lambda rank=rank: add(shuffled[rank]))
+            add(unsupervised[rank])
+
+            def reduce(values, op, rank=rank):
+                if values.numel() == 2:
+                    self.assertAlmostEqual(values[0].item(), (9, 16)[rank])
+                    values.copy_(torch.tensor([25, 10], dtype=torch.float64))
+                else:
+                    self.assertEqual(values.numel(), 19)
+                    torch.testing.assert_close(values, local_statistics[rank], rtol=0, atol=0)
+                    values.add_(local_statistics[1 - rank])
+
+            def random_chunks(key, current_rank, rank=rank):
+                self.assertEqual(current_rank, rank)
+                return iter(((0, 0, gaussian[rank].double()),))
+
+            with patch.object(trajectory, "_random_chunks", side_effect=random_chunks):
+                with patch.object(torch.distributed, "all_reduce", side_effect=reduce) as reduction:
+                    record = trajectory.finish_step(module, metadata(), rank=rank, world_size=2)
+            self.assertEqual(reduction.call_count, 2)
+            for index, comparison in enumerate((record, record["baselines"]["shuffled_labels"],
+                                                 record["baselines"]["random_update"])):
+                for offset, name in ((0, "endpoint"), (3, "path")):
+                    actual = comparison[name]
+                    values = expected[6 * index + offset:6 * index + offset + 3]
+                    self.assertEqual(actual, diagnostics._comparison_statistics(*values.tolist()))
+            self.assertEqual(record["baselines"]["random_update"]["target_step_norm"], 5)
+
+    def test_random_rng_is_reproducible_rank_step_separated_and_chunk_independent(self):
+        module = model()
+        trajectory = diagnostics.OptimizationTrajectory(module, torch.optim.AdamW(module.parameters()),
+                                                       baselines=True, seed=17)
+        rng = torch.random.get_rng_state().clone()
+        first = list(trajectory._random_chunks("step1", 0))
+        with patch.object(diagnostics, "CHUNK_SIZE", 1):
+            repeated = list(trajectory._random_chunks("step1", 0))
+        other_rank = list(trajectory._random_chunks("step1", 1))
+        other_step = list(trajectory._random_chunks("step2", 0))
+        self.assertTrue(torch.equal(torch.random.get_rng_state(), rng))
+        for a, b, c, d in zip(first, repeated, other_rank, other_step):
+            self.assertTrue(torch.equal(a[2], b[2]))
+            self.assertFalse(torch.equal(a[2], c[2]))
+            self.assertFalse(torch.equal(a[2], d[2]))
+
+    def test_zero_actual_update_has_zero_random_step_and_undefined_direction(self):
+        module = nn.Linear(2, 1, bias=False, dtype=torch.float64)
+        with torch.no_grad():
+            module.weight.zero_()
+        optimizer = torch.optim.AdamW(module.parameters())
+        trajectory = diagnostics.OptimizationTrajectory(module, optimizer, baselines=True)
+        trajectory.supervised_step(module, optimizer, lambda: None, shuffled_callback=lambda: None)
+        record = trajectory.finish_step(module, metadata())
+        random = record["baselines"]["random_update"]
+        self.assertEqual(random["target_step_norm"], 0)
+        self.assertEqual(random["applied_step_norm"], 0)
+        self.assertEqual(random["step_norm_relative_error"], 0)
+        for comparison in (record, *record["baselines"].values()):
+            for name in ("endpoint", "path"):
+                self.assertEqual(comparison[name]["status"], "both_zero")
+                self.assertIsNone(comparison[name]["cosine"])
+
+    def test_tiny_random_updates_report_fp32_rounding_and_use_realized_path_increments(self):
+        module = nn.Linear(1, 1, bias=False, dtype=torch.float64)
+        with torch.no_grad():
+            module.weight.zero_()
+        optimizer = torch.optim.AdamW(module.parameters())
+        trajectory = diagnostics.OptimizationTrajectory(module, optimizer, baselines=True)
+
+        def add_one():
+            with torch.no_grad():
+                module.weight.add_(1)
+
+        trajectory.supervised_step(module, optimizer, add_one, shuffled_callback=add_one)
+        add_one()
+        first = trajectory.finish_step(module, metadata())
+        random_before = self.random_displacement(trajectory)
+        trajectory.supervised_step(module, optimizer, lambda: None, shuffled_callback=lambda: None)
+        with torch.no_grad():
+            module.weight.add_(2 ** -40)
+        final = trajectory.finish_step(module, {**metadata(), "step": 2})
+        random = final["baselines"]["random_update"]
+        self.assertGreater(random["target_step_norm"], 0)
+        self.assertEqual(random["applied_step_norm"], 0)
+        self.assertEqual(random["step_norm_relative_error"], 1)
+        self.assertTrue(torch.equal(self.random_displacement(trajectory), random_before))
+        self.assertEqual(random["path"], first["baselines"]["random_update"]["path"])
+
+    def test_resumed_segment_and_old_new_exports_keep_legacy_columns(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "trajectory"
+            module = nn.Linear(2, 1, bias=False, dtype=torch.float64)
+            optimizer = torch.optim.AdamW(module.parameters())
+
+            def add(values):
+                with torch.no_grad():
+                    module.weight.add_(torch.tensor([values], dtype=torch.float64))
+
+            old = diagnostics.OptimizationTrajectory(module, optimizer)
+            old.supervised_step(module, optimizer, lambda: add([1, 0]))
+            add([0, 1])
+            old_record = old.finish_step(module, metadata())
+            diagnostics.save_trajectory_statistics(old_record, directory)
+            resumed = diagnostics.OptimizationTrajectory(module, optimizer, baselines=True, seed=19)
+            resumed.supervised_step(module, optimizer, lambda: add([0, 2]),
+                                    shuffled_callback=lambda: add([2, 0]))
+            add([1, 0])
+            new_record = resumed.finish_step(module, {**metadata(), "step": 200})
+            diagnostics.save_trajectory_statistics(new_record, directory)
+            self.assertEqual(new_record["updates"], 1)
+            self.assertEqual(new_record["start_update"], "step_000200_epoch_000_minibatch_0000")
+            self.assertNotEqual(new_record["origin_parameter_fingerprint_local"],
+                                old_record["origin_parameter_fingerprint_local"])
+            self.assertEqual(old_record["version"], 1)
+            self.assertNotIn("baselines", old_record)
+            self.assertAlmostEqual(new_record["endpoint"]["supervised_norm"], 2)
+            self.assertAlmostEqual(new_record["endpoint"]["unsupervised_norm"], 1)
+            output = Path(temporary) / "export"
+            path = diagnostics.compare_paired_run(directory, output)
+            with path.open(encoding="utf-8", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["shuffled_labels_endpoint_cosine"], "")
+            self.assertEqual(rows[0]["random_update_endpoint_cosine"], "")
+            self.assertEqual(rows[0]["start_update"], "step_000001_epoch_000_minibatch_0000")
+            self.assertEqual(rows[1]["baseline_seed"], "19")
+            self.assertEqual(rows[1]["updates"], "1")
+            for name in ("endpoint", "path"):
+                self.assertIn(f"{name}_dot_product", rows[1])
+                self.assertIn(f"shuffled_labels_{name}_dot_product", rows[1])
+                self.assertIn(f"random_update_{name}_dot_product", rows[1])
+            self.assertGreater((output / "trajectory_comparison.png").stat().st_size, 1000)
+
+    def test_single_step_switch_keeps_legacy_default_and_rejects_noop_paired_configuration(self):
+        config = configuration()
+        record = config.actor_rollout_ref.actor.gradient_record
+        self.assertTrue(diagnostics.paired_recording_due(record, 1))
+        record["single_step"] = {"enabled": False}
+        self.assertFalse(diagnostics.paired_recording_due(record, 1))
+        with self.assertRaisesRegex(ValueError, "trajectory.enabled=True or single_step.enabled=True"):
+            diagnostics.validate_gradient_recording(config)
+        record["trajectory"] = {"enabled": True}
+        diagnostics.validate_gradient_recording(config)
+        record["mode"] = "full"
+        record["trajectory"]["enabled"] = False
+        diagnostics.validate_gradient_recording(config)
+        self.assertTrue(diagnostics.recording_due(record, 1))
 
 
 if __name__ == "__main__":

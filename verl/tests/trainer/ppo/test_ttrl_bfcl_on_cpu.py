@@ -22,6 +22,7 @@ from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage, compute_
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import compute_reward, load_reward_manager
 from verl.trainer.ppo.ttrl_utils import (
+    EpochFailureWeights,
     _majority_vote,
     apply_ttrl_failure_weights,
     apply_ttrl_q_weights,
@@ -1165,6 +1166,170 @@ class TestTTRLFailureWeights(unittest.TestCase):
         self.assertEqual(set(batch.batch), set(before))
         for key, tensor in before.items():
             self.assertIs(batch.batch[key], tensor, key)
+
+    def dynamic(self, **overrides):
+        return EpochFailureWeights(self.config(epoch_frequency={"enabled": True}, **overrides))
+
+    def test_epoch_disabled_controller_does_not_access_batch(self):
+        controller = EpochFailureWeights({"enabled": False})
+        controller.observe(PoisonOracle())
+        self.assertEqual(controller.finish_epoch(), {})
+        self.assertEqual(controller.total_rollouts, 0)
+        self.assertEqual(controller.completed_epochs, 0)
+
+    def test_epoch_weights_are_fixed_until_boundary_then_follow_rollout_rates(self):
+        controller = self.dynamic()
+        original = controller.effective_config()
+        batch = self.make_batch([
+            [self.event(), self.event()],
+            [self.event("schema_failure")],
+            [self.event(), self.event("precondition_violation")],
+            [],
+        ])
+        controller.observe(batch)
+        self.assertEqual(controller.effective_config(), original)
+        metrics = controller.finish_epoch()
+        self.assertEqual(controller.current_weights, {
+            "format_failure": 1.5, "schema_failure": 1.25, "precondition_violation": 1.25,
+        })
+        self.assertEqual(metrics["failure_epoch_completed"], 1)
+        self.assertEqual(metrics["failure_epoch_rollouts"], 4)
+        self.assertEqual(metrics["failure_epoch_format_failure_count"], 2)
+        self.assertEqual(metrics["failure_epoch_format_failure_rate"], 0.5)
+        self.assertEqual(metrics["failure_epoch_format_failure_weight"], 2.0)
+        self.assertEqual(metrics["failure_epoch_format_failure_next_weight"], 1.5)
+        self.assertEqual(controller.total_rollouts, 0)
+        self.assertEqual(sum(controller.counts.values()), 0)
+
+    def test_epoch_counts_include_invalid_and_lower_priority_types_without_mutation(self):
+        controller = self.dynamic()
+        both = [self.event(), self.event("schema_failure"), self.event("schema_failure")]
+        batch = self.make_batch([both, both, [], []])
+        batch.non_tensor_batch["bfcl_valid"] = np.array([False, True, False, True])
+        metadata = deepcopy(batch.non_tensor_batch)
+        tensors = dict(batch.batch)
+        controller.observe(batch)
+        self.assertEqual(controller.counts, {
+            "format_failure": 2, "schema_failure": 2, "precondition_violation": 0,
+        })
+        self.assertEqual(controller.total_rollouts, 4)
+        self.assertEqual(batch.non_tensor_batch["failure_modes"].tolist(), metadata["failure_modes"].tolist())
+        for key, tensor in tensors.items():
+            self.assertIs(batch.batch[key], tensor, key)
+        # Epoch occurrence statistics include both types, while the existing
+        # per-turn utility still uses the higher-priority format diagnosis.
+        apply_ttrl_failure_weights(batch, controller.effective_config())
+        torch.testing.assert_close(batch.batch["ttrl_failure_weight"], torch.tensor([2., 2., 1., 1.]))
+
+    def test_epoch_counts_new_rollouts_once_and_do_not_accumulate_across_epochs(self):
+        controller = self.dynamic()
+        controller.observe(self.make_batch([[self.event()]] * 4))
+        controller.finish_epoch()
+        controller.observe(self.make_batch([[], [], [], []]))
+        metrics = controller.finish_epoch()
+        self.assertEqual(metrics["failure_epoch_completed"], 2)
+        self.assertEqual(metrics["failure_epoch_rollouts"], 4)
+        self.assertEqual(controller.current_weights, dict.fromkeys(controller.current_weights, 1.0))
+
+    def test_epoch_recovery_status_and_turn_count_do_not_change_occurrence_unit(self):
+        controller = self.dynamic()
+        controller.observe(self.make_batch([
+            [self.event(turn=0, recovery="recovered"), self.event(turn=2, recovery="unrecovered")],
+            [self.event(recovery="unknown")], [], [],
+        ], [3, 1, 2, 2]))
+        self.assertEqual(controller.counts["format_failure"], 2)
+        self.assertEqual(controller.finish_epoch()["failure_epoch_format_failure_rate"], 0.5)
+
+    def test_epoch_rates_are_invariant_to_batch_partition_and_rollout_order(self):
+        whole, split = self.dynamic(), self.dynamic()
+        events = [
+            [self.event()], [], [self.event("schema_failure")], [],
+            [self.event("precondition_violation")], [], [self.event()], [],
+        ]
+        whole.observe(self.make_batch(events))
+        split.observe(self.make_batch(list(reversed(events[4:]))))
+        split.observe(self.make_batch(list(reversed(events[:4]))))
+        self.assertEqual(whole.finish_epoch(), split.finish_epoch())
+        self.assertEqual(whole.state_dict(), split.state_dict())
+
+    def test_epoch_empty_boundary_preserves_state_and_config_copies_are_isolated(self):
+        controller = self.dynamic()
+        original = controller.state_dict()
+        effective = controller.effective_config()
+        effective["type_weights"]["format_failure"] = 99.0
+        effective["epoch_frequency"]["enabled"] = False
+        self.assertEqual(controller.finish_epoch(), {})
+        self.assertEqual(controller.state_dict(), original)
+        self.assertTrue(controller.effective_config()["epoch_frequency"]["enabled"])
+
+    def test_epoch_dynamic_utilities_use_existing_turn_average_and_leave_reference_unweighted(self):
+        controller = self.dynamic()
+        controller.observe(self.make_batch([[self.event()], [], [], []]))
+        controller.finish_epoch()
+        batch = self.make_batch([[self.event()], [], [], []], [2, 2, 2, 2])
+        original = {key: tensor.clone() for key, tensor in batch.batch.items()}
+        apply_ttrl_failure_weights(batch, controller.effective_config())
+        torch.testing.assert_close(batch.batch["ttrl_failure_weight"], torch.tensor([1.125, 1., 1., 1.]))
+        torch.testing.assert_close(batch.batch["advantages"], original["advantages"] * torch.tensor([1.125, 1., 1., 1.])[:, None])
+        for key in ("diagnostic_supervised_advantages", "returns", "token_level_scores", "response_mask"):
+            torch.testing.assert_close(batch.batch[key], original[key], rtol=0, atol=0)
+
+    def test_epoch_checkpoint_round_trip_restores_partial_epoch_and_next_update(self):
+        original = self.dynamic()
+        first = self.make_batch([[self.event()], [], [], []])
+        second = self.make_batch([[self.event("schema_failure")], [], [], []])
+        original.observe(first)
+        original.finish_epoch()
+        original.observe(first)
+        saved = json.loads(json.dumps(original.state_dict()))
+        restored = self.dynamic()
+        restored.load_state_dict(saved)
+        saved["counts"]["format_failure"] = 999  # Loading takes independent copies.
+        self.assertEqual(restored.state_dict(), original.state_dict())
+        for controller in (original, restored):
+            controller.observe(second)
+        self.assertEqual(original.finish_epoch(), restored.finish_epoch())
+        self.assertEqual(original.state_dict(), restored.state_dict())
+
+    def test_epoch_malformed_batch_cannot_partially_change_counts(self):
+        controller = self.dynamic()
+        batch = self.make_batch([[self.event()], [], [], [self.event(turn=9)]])
+        before = controller.state_dict()
+        with self.assertRaisesRegex(ValueError, "processed user turn"):
+            controller.observe(batch)
+        self.assertEqual(controller.state_dict(), before)
+
+    def test_epoch_configuration_validates_dynamic_flag_even_when_disabled(self):
+        invalids = (
+            {"enabled": False, "epoch_frequency": {"enabled": True}},
+            {"enabled": False, "epoch_frequency": {"enabled": "true"}},
+            {"enabled": False, "epoch_frequency": {"enabled": 1}},
+            {"epoch_frequency": []},
+            {"epoch_frequency": {"enabled": True}, "min_weight": 1.1},
+            {"epoch_frequency": {"enabled": True}, "max_weight": 0.9},
+        )
+        for invalid in invalids:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_failure_weight_config(self.config(**invalid))
+        controller = self.dynamic(max_weight=3.0)
+        controller.observe(self.make_batch([[self.event()], [], [], []]))
+        self.assertEqual(controller.finish_epoch()["failure_epoch_format_failure_next_weight"], 1.5)
+
+    def test_epoch_checkpoint_rejects_corrupt_state_before_mutating_controller(self):
+        controller = self.dynamic()
+        original = controller.state_dict()
+        invalids = (
+            {"version": 0}, {"current_weights": {}}, {"total_rollouts": -1},
+            {"total_rollouts": True}, {"completed_epochs": 0.5},
+            {"counts": dict.fromkeys(controller.counts, 1)},
+            {"initial_weights": {}},
+            {"weight_bounds": {"min_weight": 0.5, "max_weight": 3.0}},
+            {"current_weights": {**controller.current_weights, "format_failure": float("nan")}},
+        )
+        for invalid in invalids:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                controller.load_state_dict({**original, **invalid})
+            self.assertEqual(controller.state_dict(), original)
 
     def test_neutral_and_turn_profiles_include_all_confirmed_recovery_states(self):
         events = [

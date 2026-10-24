@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections import Counter
+from copy import deepcopy
 from typing import List
 
 import numpy as np
@@ -121,11 +122,23 @@ def validate_q_weight_config(config):
             raise ValueError(f"Invalid ttrl.q_weight.{key}: {value}")
 
 
+_FAILURE_TYPE_WEIGHTS = {"format_failure": 2.0, "schema_failure": 2.0, "precondition_violation": 1.5}
+_FAILURE_PRIORITIES = {kind: priority for priority, kind in enumerate(_FAILURE_TYPE_WEIGHTS)}
+
+
 def validate_failure_weight_config(config):
     """SEAL-style positive utilities over our deployment-observable failure types."""
     enabled = config.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("failure_mode_detection.advantage_weight.enabled must be a boolean")
+    dynamic = config.get("epoch_frequency", {})
+    if not hasattr(dynamic, "get"):
+        raise ValueError("failure advantage epoch_frequency must be a mapping")
+    dynamic_enabled = dynamic.get("enabled", False)
+    if not isinstance(dynamic_enabled, bool):
+        raise ValueError("failure advantage epoch_frequency.enabled must be a boolean")
+    if dynamic_enabled and not enabled:
+        raise ValueError("epoch_frequency requires failure advantage weighting enabled")
     if not enabled:
         return
     for key, default in (("min_weight", 0.5), ("max_weight", 2.0)):
@@ -134,16 +147,156 @@ def validate_failure_weight_config(config):
             raise ValueError(f"failure_mode_detection.advantage_weight.{key} must be finite and positive")
     if config.get("min_weight", 0.5) > config.get("max_weight", 2.0):
         raise ValueError("failure advantage min_weight must not exceed max_weight")
+    if dynamic_enabled and not config.get("min_weight", 0.5) <= 1.0 <= config.get("max_weight", 2.0):
+        raise ValueError("epoch_frequency requires min_weight <= 1 <= max_weight to preserve neutral turns")
     utilities = config.get("type_weights", {})
     if not hasattr(utilities, "items"):
         raise ValueError("failure advantage type_weights must map failure types to positive utilities")
-    defaults = {"format_failure": 2.0, "schema_failure": 2.0, "precondition_violation": 1.5}
-    if set(utilities) - set(defaults):
+    if set(utilities) - set(_FAILURE_TYPE_WEIGHTS):
         raise ValueError("failure advantage type_weights contains an unsupported failure type")
-    for kind, default in defaults.items():
+    for kind, default in _FAILURE_TYPE_WEIGHTS.items():
         value = utilities.get(kind, default)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value <= 0:
             raise ValueError(f"failure advantage type_weights.{kind} must be finite and positive")
+
+
+def _failure_profiles(batch):
+    """Validate observable diagnostics once; return turn profiles and all seen types."""
+    fields = ("failure_modes", "failure_mode_detection_enabled", "failure_mode_num_turns")
+    if any(
+        field not in batch.non_tensor_batch
+        or not hasattr(batch.non_tensor_batch[field], "__len__")
+        or len(batch.non_tensor_batch[field]) != len(batch)
+        for field in fields
+    ):
+        raise ValueError("Failure advantage weighting requires aligned diagnostics and processed user-turn counts")
+    profiles = []
+    for events, enabled, turns in zip(*(batch.non_tensor_batch[field] for field in fields)):
+        if not isinstance(enabled, (bool, np.bool_)) or not enabled:
+            raise ValueError(
+                "Failure advantage weighting requires failure_mode_detection.enabled=True on every rollout"
+            )
+        if isinstance(turns, (bool, np.bool_)) or not isinstance(turns, (int, np.integer)) or turns < 1:
+            raise ValueError("failure_mode_num_turns must be a positive processed user-turn count")
+        if not isinstance(events, list):
+            raise ValueError("failure_modes must contain one event list per rollout")
+        dominant, observed = {}, set()
+        for event in events:
+            if not isinstance(event, dict) or event.get("type") not in _FAILURE_PRIORITIES:
+                raise ValueError("Unsupported or missing failure event type")
+            turn = event.get("turn")
+            if isinstance(turn, (bool, np.bool_)) or not isinstance(turn, (int, np.integer)) or not 0 <= turn < turns:
+                raise ValueError("Failure event turn must index a processed user turn")
+            if event.get("recovery") not in ("recovered", "unrecovered", "unknown"):
+                raise ValueError("Failure event recovery must be recovered, unrecovered or unknown")
+            kind = event["type"]
+            observed.add(kind)
+            if turn not in dominant or _FAILURE_PRIORITIES[kind] < _FAILURE_PRIORITIES[dominant[turn]]:
+                dominant[turn] = kind
+        profiles.append((int(turns), dominant, observed))
+    return profiles
+
+
+class EpochFailureWeights:
+    """Hold failure utilities fixed within an epoch; adapt only at its boundary.
+
+    Each new training rollout is observed once, including invalid consensus
+    rollouts. A failure type contributes at most one occurrence per rollout,
+    regardless of event count or recovery. Types can co-occur, so their rates
+    need not sum to one. The first epoch uses the configured static utilities.
+    """
+
+    def __init__(self, config):
+        validate_failure_weight_config(config)
+        self.enabled = config.get("epoch_frequency", {}).get("enabled", False)
+        self._config = deepcopy(dict(config))
+        self._config["epoch_frequency"] = dict(config.get("epoch_frequency", {}))
+        self.initial_weights = dict(_FAILURE_TYPE_WEIGHTS)
+        if config.get("enabled", False):
+            self.initial_weights.update(config.get("type_weights", {}))
+        self.current_weights = dict(self.initial_weights)
+        self.counts = {kind: 0 for kind in _FAILURE_TYPE_WEIGHTS}
+        self.total_rollouts = 0
+        self.completed_epochs = 0
+
+    def effective_config(self):
+        config = deepcopy(self._config)
+        config["type_weights"] = dict(self.current_weights)
+        return config
+
+    def observe(self, batch):
+        if not self.enabled:
+            return
+        # Validate the whole batch before mutating counters. Do not filter by
+        # consensus validity: truncated/blocked rollouts also contain failures.
+        profiles = _failure_profiles(batch)
+        for _, _, observed in profiles:
+            for kind in observed:
+                self.counts[kind] += 1
+        self.total_rollouts += len(profiles)
+
+    def finish_epoch(self):
+        if not self.enabled or not self.total_rollouts:
+            return {}
+        self.completed_epochs += 1
+        metrics = {
+            "failure_epoch_completed": self.completed_epochs,
+            "failure_epoch_rollouts": self.total_rollouts,
+        }
+        maximum = self._config.get("max_weight", 2.0)
+        for kind, count in self.counts.items():
+            rate = count / self.total_rollouts
+            next_weight = 1.0 + (maximum - 1.0) * rate
+            metrics.update({
+                f"failure_epoch_{kind}_count": count,
+                f"failure_epoch_{kind}_rate": rate,
+                f"failure_epoch_{kind}_weight": self.current_weights[kind],
+                f"failure_epoch_{kind}_next_weight": next_weight,
+            })
+            self.current_weights[kind] = next_weight
+        self.counts = {kind: 0 for kind in _FAILURE_TYPE_WEIGHTS}
+        self.total_rollouts = 0
+        return metrics
+
+    def state_dict(self):
+        return {
+            "version": 1,
+            "weight_bounds": {
+                "min_weight": self._config.get("min_weight", 0.5),
+                "max_weight": self._config.get("max_weight", 2.0),
+            },
+            "initial_weights": dict(self.initial_weights),
+            "current_weights": dict(self.current_weights),
+            "counts": dict(self.counts),
+            "total_rollouts": self.total_rollouts,
+            "completed_epochs": self.completed_epochs,
+        }
+
+    def load_state_dict(self, state):
+        if not isinstance(state, dict) or type(state.get("version")) is not int or state["version"] != 1:
+            raise ValueError("Unsupported epoch failure weight checkpoint")
+        if state.get("weight_bounds") != self.state_dict()["weight_bounds"]:
+            raise ValueError("Checkpoint failure weight bounds differ from the current configuration")
+        weights = state.get("current_weights")
+        if not isinstance(weights, dict) or set(weights) != set(_FAILURE_TYPE_WEIGHTS):
+            raise ValueError("Checkpoint current_weights must contain every supported failure type")
+        validate_failure_weight_config({**self._config, "type_weights": weights})
+        if state.get("initial_weights") != self.initial_weights:
+            raise ValueError("Checkpoint initial failure weights differ from the current configuration")
+        total = state.get("total_rollouts")
+        completed = state.get("completed_epochs")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (total, completed)):
+            raise ValueError("Checkpoint rollout and completed-epoch counts must be nonnegative integers")
+        counts = state.get("counts")
+        if not isinstance(counts, dict) or set(counts) != set(_FAILURE_TYPE_WEIGHTS) or any(
+            isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= total
+            for value in counts.values()
+        ):
+            raise ValueError("Checkpoint failure counts must be integers between zero and total_rollouts")
+        self.current_weights = dict(weights)
+        self.counts = dict(counts)
+        self.total_rollouts = total
+        self.completed_epochs = completed
 
 
 def apply_ttrl_failure_weights(batch, config):
@@ -161,36 +314,9 @@ def apply_ttrl_failure_weights(batch, config):
         return {}
     if "ttrl_failure_weight" in batch.batch:
         raise ValueError("Failure advantage weights must be applied exactly once per training batch")
-    fields = ("failure_modes", "failure_mode_detection_enabled", "failure_mode_num_turns")
-    if any(
-        field not in batch.non_tensor_batch or len(batch.non_tensor_batch[field]) != len(batch) for field in fields
-    ):
-        raise ValueError("Failure advantage weighting requires aligned diagnostics and processed user-turn counts")
-    priorities = {"format_failure": 0, "schema_failure": 1, "precondition_violation": 2}
-    utilities = {"format_failure": 2.0, "schema_failure": 2.0, "precondition_violation": 1.5}
-    utilities.update(config.get("type_weights", {}))
+    utilities = {**_FAILURE_TYPE_WEIGHTS, **config.get("type_weights", {})}
     weights, detected = [], []
-    for events, enabled, turns in zip(*(batch.non_tensor_batch[field] for field in fields)):
-        if not isinstance(enabled, (bool, np.bool_)) or not enabled:
-            raise ValueError(
-                "Failure advantage weighting requires failure_mode_detection.enabled=True on every rollout"
-            )
-        if isinstance(turns, (bool, np.bool_)) or not isinstance(turns, (int, np.integer)) or turns < 1:
-            raise ValueError("failure_mode_num_turns must be a positive processed user-turn count")
-        if not isinstance(events, list):
-            raise ValueError("failure_modes must contain one event list per rollout")
-        dominant = {}
-        for event in events:
-            if not isinstance(event, dict) or event.get("type") not in priorities:
-                raise ValueError("Unsupported or missing failure event type")
-            turn = event.get("turn")
-            if isinstance(turn, (bool, np.bool_)) or not isinstance(turn, (int, np.integer)) or not 0 <= turn < turns:
-                raise ValueError("Failure event turn must index a processed user turn")
-            if event.get("recovery") not in ("recovered", "unrecovered", "unknown"):
-                raise ValueError("Failure event recovery must be recovered, unrecovered or unknown")
-            kind = event["type"]
-            if turn not in dominant or priorities[kind] < priorities[dominant[turn]]:
-                dominant[turn] = kind
+    for turns, dominant, _ in _failure_profiles(batch):
         # Unobserved failures are not success labels. Neutral turns retain scale 1.
         utility = 1.0 + sum((utilities[kind] - 1.0) / int(turns) for kind in dominant.values())
         weights.append(float(np.clip(utility, config.get("min_weight", 0.5), config.get("max_weight", 2.0))))

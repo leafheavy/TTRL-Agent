@@ -728,7 +728,9 @@ class TestPairedRandomBaselines(unittest.TestCase):
             random_values[0].item() / math.sqrt(random_values[2].item()), random_values[1].item(), 1
         )
         actor = make_actor(True, self.root / "baselines", mode="paired")
-        actor.gradient_record_config["baselines"] = {"enabled": True, "seed": 23}
+        actor.gradient_record_config.update(
+            baselines={"enabled": True, "seed": 23}, single_step={"enabled": True}
+        )
         torch.manual_seed(101)
         with patch.object(actor, "_backward_micro_batches", wraps=actor._backward_micro_batches) as backward:
             actor.update_policy(batch)
@@ -807,6 +809,121 @@ class TestPairedRandomBaselines(unittest.TestCase):
         result = json.loads(next((self.root / "legacy").glob("*.json")).read_text(encoding="utf-8"))
         self.assertNotIn("baselines", result)
         self.assertNotIn("baseline_metadata", result)
+
+
+class TestTrajectoryBaselineWiring(unittest.TestCase):
+    def setUp(self):
+        TestPolicyGradientRecording.setUp(self)
+
+    def test_single_step_switch_and_legacy_default_do_not_change_full_recording(self):
+        for mode, single_step, enabled, expected_backwards in (
+            ("paired", None, True, 3),
+            ("paired", True, True, 3),
+            ("paired", False, True, 1),
+            ("paired", True, False, 1),
+            ("full", False, True, 2),
+        ):
+            with self.subTest(mode=mode, single_step=single_step, enabled=enabled):
+                directory = self.root / f"{mode}_{single_step}_{enabled}"
+                actor = make_actor(enabled, directory, mode=mode)
+                if single_step is not None:
+                    actor.gradient_record_config["single_step"] = {"enabled": single_step}
+                batch = paired_batch() if mode == "paired" and expected_backwards == 3 else sample_batch()
+                torch.manual_seed(101)
+                with patch.object(actor, "_backward_micro_batches", wraps=actor._backward_micro_batches) as backward:
+                    actor.update_policy(batch)
+                self.assertEqual(backward.call_count, expected_backwards)
+                self.assertEqual(directory.exists(), expected_backwards > 1)
+
+    def test_shuffled_trajectory_uses_its_own_full_adamw_path_at_every_minibatch(self):
+        recorded = make_actor(False, self.root / "trajectory", mode="paired")
+        ordinary = make_actor(False, self.root / "ordinary")
+        supervised = make_actor(False, self.root / "supervised")
+        shuffled = make_actor(False, self.root / "shuffled")
+        actors = (recorded, ordinary, supervised, shuffled)
+        for actor in actors:
+            torch.manual_seed(73)
+            actor.update_policy(sample_batch())
+            actor.config.ppo_mini_batch_size = 2
+            actor.config.ppo_micro_batch_size_per_gpu = 1
+            actor.config.ppo_epochs = 2
+        recorded.gradient_record_config.update(
+            enabled=True, interval=10, single_step={"enabled": False},
+            trajectory={"enabled": True}, baselines={"enabled": True, "seed": 23},
+        )
+        for step, learning_rate in ((2, 0.003), (3, 0.008)):
+            batch = TestPairedRandomBaselines.baseline_batch(step)
+            batch.meta_info["gradient_record"]["final_step"] = step == 3
+            originals = {key: value.clone() for key, value in batch.batch.items()}
+            for actor in actors:
+                actor.actor_optimizer.param_groups[0]["lr"] = learning_rate
+            for reference, advantages_key in (
+                (supervised, "diagnostic_supervised_advantages"),
+                (shuffled, "diagnostic_shuffled_advantages"),
+            ):
+                reference_batch = Batch({**batch.batch, "advantages": batch.batch[advantages_key]})
+                reference_batch.meta_info["temperature"] = 1.0
+                torch.manual_seed(200 + step)
+                reference.update_policy(reference_batch)
+            torch.manual_seed(200 + step)
+            expected_metrics = ordinary.update_policy(sample_batch(step))
+            expected_rng = torch.random.get_rng_state().clone()
+            torch.manual_seed(200 + step)
+            with patch.object(recorded, "_record_policy_gradient", side_effect=AssertionError("legacy snapshot ran")):
+                with patch.object(
+                    recorded, "_backward_micro_batches", wraps=recorded._backward_micro_batches
+                ) as backward:
+                    actual_metrics = recorded.update_policy(batch)
+            self.assertEqual(backward.call_count, 12)
+            self.assertTrue(all(not call.kwargs.get("policy_only", False) for call in backward.call_args_list))
+            TestPairedRandomBaselines.assert_training_state_equal(self, recorded, ordinary)
+            self.assertEqual(actual_metrics, expected_metrics)
+            self.assertTrue(torch.equal(torch.random.get_rng_state(), expected_rng))
+            for key, value in originals.items():
+                self.assertTrue(torch.equal(batch.batch[key], value), key)
+            trajectory = recorded.optimization_trajectory
+            self.assertEqual(trajectory.updates, (step - 1) * 4)
+            for parameters, optimizer_state, reference in (
+                (trajectory.supervised_parameters, trajectory.supervised_optimizer_state, supervised),
+                (trajectory.shuffled_parameters, trajectory.shuffled_optimizer_state, shuffled),
+            ):
+                for value, expected in zip(parameters, reference.actor_module.parameters()):
+                    torch.testing.assert_close(value, expected.detach(), rtol=0, atol=0)
+                restored = diagnostics._restore_state(optimizer_state)
+                self.assertEqual(len(restored), len(reference.actor_optimizer.state))
+                for value, expected in zip(restored.values(), reference.actor_optimizer.state.values()):
+                    self.assertEqual(value.keys(), expected.keys())
+                    for key in value:
+                        torch.testing.assert_close(value[key], expected[key], rtol=0, atol=0)
+            if step == 2:
+                self.assertFalse((self.root / "trajectory").exists())
+        records = sorted((self.root / "trajectory").glob("trajectory_step_*.json"))
+        self.assertEqual(len(records), 4)
+        final = json.loads(records[-1].read_text(encoding="utf-8"))
+        self.assertEqual(final["updates"], 8)
+        self.assertEqual(final["start_update"], "step_000002_epoch_000_minibatch_0000")
+        self.assertEqual(final["end_update"], "step_000003_epoch_001_minibatch_0001")
+        self.assertEqual(set(final["baselines"]), {"shuffled_labels", "random_update"})
+        self.assertFalse(list((self.root / "trajectory").glob("step_*.json")))
+        self.assertFalse(list((self.root / "trajectory").rglob("*.bin")))
+        self.assertTrue(any(
+            not torch.equal(left, right)
+            for left, right in zip(trajectory.supervised_parameters, trajectory.shuffled_parameters)
+        ))
+
+    def test_trajectory_without_baselines_does_not_require_shuffle_or_policy_only_passes(self):
+        actor = make_actor(True, self.root / "supervised_only", mode="paired")
+        actor.gradient_record_config.update(
+            single_step={"enabled": False}, trajectory={"enabled": True}, baselines={"enabled": False}
+        )
+        with patch.object(actor, "_backward_micro_batches", wraps=actor._backward_micro_batches) as backward:
+            actor.update_policy(paired_batch())
+        self.assertEqual(backward.call_count, 2)
+        self.assertTrue(all(not call.kwargs.get("policy_only", False) for call in backward.call_args_list))
+        path = next((self.root / "supervised_only").glob("trajectory_step_*.json"))
+        record = json.loads(path.read_text(encoding="utf-8"))
+        self.assertFalse(record.get("baselines"))
+        self.assertFalse(list((self.root / "supervised_only").glob("step_*.json")))
 
 
 if __name__ == "__main__":
