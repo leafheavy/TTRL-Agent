@@ -220,14 +220,14 @@ actor_rollout_ref:
       enabled: false
 
       # full: legacy FP32 gradient files; paired: shared-rollout trajectory/statistics JSON.
-      mode: full
+      mode: paired
 
       # Legacy same-point policy gradients are opt-in for new configurations.
       # Configurations without this field keep their previous snapshot behavior.
       single_step:
         enabled: false
 
-      # Random directions and shuffled labels, including independent update paths.
+      # Shuffled labels are the default baseline; random directions are opt-in.
       baselines:
         enabled: true
         seed: 0
@@ -236,25 +236,14 @@ actor_rollout_ref:
           enabled: true
         # Same-point random gradients and the trajectory's random_update path.
         random_direction:
-          enabled: true
+          enabled: false
 
       # Independent supervised and optional shuffled-label optimizer branches.
       # Gaussian update paths match each real TTRL step's global L2 norm.
       # CPU parameter/optimizer snapshots are expensive; FSDP1 only.
       # When enabled, score and advance EVERY minibatch; interval only controls output.
       trajectory:
-        enabled: false
-
-      # Stage one records U-vs-S plus every rank's complete replay minibatches.
-      # Stage two uses trainer.replay_gradient and has no online TTRL/sampler.
-      two_stage:
-        enabled: false
-        replay_dir: ${trainer.default_local_dir}/gradient_replay
-        # Reuse the existing original model; write no parameter/Adam checkpoint.
-        # Requires a fresh, empty optimizer and an exactly matching model origin.
-        initial_state: pretrained
-        # Decimal GB, shared across ranks; leave space for other run files.
-        max_archive_gb: 4.0
+        enabled: true
 
       # Derived from the run directory; paired needs trajectory or single_step enabled.
       # All ranks share this directory on multi-GPU jobs.
@@ -369,6 +358,9 @@ actor_rollout_ref:
 
       # Weight decay
       weight_decay: 0.01
+
+      # null keeps PyTorch's automatic choice; false lowers AdamW step peak memory.
+      foreach: null
 
     # configs for FSDP
     fsdp_config:

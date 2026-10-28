@@ -648,11 +648,15 @@ class RayPPOTrainer:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _validate_epoch_failure_schedule(self):
-        """Dynamic weights require complete, comparable passes over the case set."""
+        """Require complete BFCL case coverage and full epochs for dynamic weights."""
         dynamic = self.config.get("failure_mode_detection", {}).get("advantage_weight", {}).get(
             "epoch_frequency", {}
         )
-        if not dynamic.get("enabled", False):
+        ttrl = self.config.get("ttrl", {})
+        bfcl_training = (
+            ttrl.get("enable", False) and ttrl.get("reward_mode", "math") == "bfcl"
+        ) or self.config.get("bfcl_supervised", {}).get("enabled", False)
+        if not dynamic.get("enabled", False) and not bfcl_training:
             return
         batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
         sampler = self.train_dataloader.sampler
@@ -660,7 +664,13 @@ class RayPPOTrainer:
             len(self.train_dataset) % batch_size or len(sampler) != len(self.train_dataset)
             or getattr(sampler, "replacement", False)
         ):
-            raise ValueError("epoch_frequency requires every case once per epoch without a dropped tail batch")
+            raise ValueError(
+                "BFCL training requires every case once per epoch without a dropped tail batch: "
+                f"{len(self.train_dataset)} cases, batch_size={batch_size}. "
+                "Choose a batch size that divides the selected case count."
+            )
+        if not dynamic.get("enabled", False):
+            return
         steps = self.config.trainer.get("total_training_steps")
         batches = len(self.train_dataloader)
         if steps is not None and (
@@ -1380,9 +1390,7 @@ class RayPPOTrainer:
         baselines = record.get("baselines", {})
         from verl.utils.gradient_diagnostics import baseline_enabled
 
-        # Stage one caches the exact shuffled advantages without constructing
-        # or advancing a shuffled-label model/optimizer branch.
-        if baseline_enabled(baselines, "shuffled_labels") or record.get("two_stage", {}).get("enabled", False):
+        if baseline_enabled(baselines, "shuffled_labels"):
             from verl.utils.gradient_diagnostics import diagnostic_seed, shuffle_outcome_rewards
 
             shuffled_rewards, metadata = shuffle_outcome_rewards(

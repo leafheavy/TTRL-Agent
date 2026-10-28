@@ -6,9 +6,14 @@ import builtins
 import importlib.util
 import json
 import os
+import re
 import shlex
+import shutil
+import socket
+import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from contextlib import asynccontextmanager
@@ -313,6 +318,24 @@ class TestTrainerMultiTurnConfig(unittest.TestCase):
         self.trainer.train_dataloader.sampler = ReplacementSampler(range(8))
         with self.assertRaisesRegex(ValueError, "every case once"):
             self.trainer._validate_epoch_failure_schedule()
+
+    def test_static_bfcl_training_also_rejects_silently_dropped_cases(self):
+        self.trainer.train_dataset = list(range(9))
+
+        class Loader:
+            sampler = list(range(9))
+
+            def __len__(self):
+                return 4
+
+        self.trainer.train_dataloader = Loader()
+        self.assertFalse(self.config.get("failure_mode_detection", {}).get("advantage_weight", {}).get(
+            "epoch_frequency", {}
+        ).get("enabled", False))
+        with self.assertRaisesRegex(ValueError, "9 cases, batch_size=2"):
+            self.trainer._validate_epoch_failure_schedule()
+        self.config.data.train_batch_size = 3
+        self.trainer._validate_epoch_failure_schedule()
 
     def test_async_agent_worker_count_is_validated_before_model_initialization(self):
         for count in (0, -1, True, 1.5, "8", None):
@@ -776,6 +799,331 @@ class TestPostTrainServing(unittest.TestCase):
                 self.trainer.serve_after_training()
         self.manager.sleep.assert_called_once_with()
         self.assertEqual(list(self.output.iterdir()), [])
+
+
+class TestIndependentMultiTurnLauncher(unittest.TestCase):
+    """Exercise the Bash workflow with CPU-only benchmark and trainer processes."""
+
+    categories = (
+        "multi_turn_base", "multi_turn_miss_func", "multi_turn_miss_param", "multi_turn_long_context",
+    )
+
+    def setUp(self):
+        self.bash = "D:/Git/bin/bash.exe" if os.name == "nt" else shutil.which("bash")
+        if not self.bash or not Path(self.bash).is_file():
+            self.skipTest("Bash is required for the launcher integration test")
+        temporary_parent = ROOT.parent / "tmp" if os.name == "nt" else None
+        if temporary_parent is not None:
+            temporary_parent.mkdir(exist_ok=True)
+        self.directory = tempfile.TemporaryDirectory(prefix="bfcl suite ", dir=temporary_parent)
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.suite = self.root / "results with spaces"
+        self.events = self.root / "events"
+        self.model = self.root / "original model"
+        self.model.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.dispatch = self.root / "fake_python.py"
+        self.dispatch.write_text(self.fake_python(), encoding="utf-8")
+        self.interpreter = self.bin / "fake-python"
+        self.interpreter.write_bytes(textwrap.dedent('''\
+            #!/usr/bin/env bash
+            if [ "${1:-}" = -u ] && [ "${2:-}" = verl/benchmark_runtime/server.py ]; then
+              "$REAL_PYTHON" "$FAKE_DISPATCH" runtime_start "$@"
+              trap '"$REAL_PYTHON" "$FAKE_DISPATCH" runtime_stop; exit 0' TERM INT
+              while true; do sleep 0.1; done
+            fi
+            exec "$REAL_PYTHON" "$FAKE_DISPATCH" "$@"
+        ''').encode("utf-8"))
+        self.interpreter.chmod(0o755)
+        if os.name == "nt":
+            # Git Bash lacks setsid. The mocked trainer also observes an abort
+            # marker so Windows can verify cleanup without process-group signals.
+            (self.bin / "setsid").write_bytes(b'#!/usr/bin/env bash\nexec "$@"\n')
+            (self.bin / "setsid").chmod(0o755)
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.runtime_port = sock.getsockname()[1]
+        self.env = dict(os.environ, **{
+            "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
+            "REAL_PYTHON": Path(sys.executable).as_posix(),
+            "FAKE_DISPATCH": self.dispatch.as_posix(),
+            "FAKE_EVENTS": str(self.events),
+            "TRAIN_CATEGORIES": "multi_turn",
+            "RUN_ROOT": self.bash_path(self.suite),
+            "MODEL_PATH": self.model.as_posix(),
+            "BFCL_PYTHON": self.bash_path(self.interpreter),
+            "TRAIN_PYTHON": self.bash_path(self.interpreter),
+            "BFCL_MODEL": "test-model-FC",
+            "BENCHMARK_RUNTIME_ENDPOINT": f"http://127.0.0.1:{self.runtime_port}",
+            "PYTHONUTF8": "1",
+            "MSYS2_ARG_CONV_EXCL": "*",
+        })
+
+    @staticmethod
+    def bash_path(path):
+        value = path.as_posix()
+        return "/" + value[0].lower() + value[2:] if os.name == "nt" else value
+
+    @staticmethod
+    def fake_python():
+        return textwrap.dedent(r'''
+            import hashlib
+            import json
+            import os
+            import re
+            import runpy
+            import shlex
+            import sys
+            import threading
+            import time
+            import uuid
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+            from pathlib import Path
+
+            def path(value):
+                if os.name == "nt" and re.match(r"^/[a-zA-Z]/", value):
+                    value = value[1] + ":" + value[2:]
+                return Path(value)
+
+            def event(kind, **fields):
+                # Separate records avoid concurrent text appends racing on Windows.
+                directory = path(os.environ["FAKE_EVENTS"])
+                directory.mkdir(exist_ok=True)
+                # Python 3.9 on Windows does not share perf_counter's epoch.
+                name = f"{time.time_ns():020d}_{os.getpid()}_{uuid.uuid4().hex}.json"
+                (directory / name).write_text(json.dumps(dict(kind=kind, **fields)), encoding="utf-8")
+
+            def value(option):
+                return args[args.index(option) + 1]
+
+            args = sys.argv[1:]
+            project = path(os.environ.get("BFCL_PROJECT_ROOT", os.environ["RUN_ROOT"]))
+            category = project.parent.name
+            if args[0] in ("runtime_start", "runtime_stop"):
+                event(args[0], category=category, arguments=args[1:])
+            elif args[0] == "-c":
+                if "MODEL_CONFIG_MAPPING" not in args[1]:
+                    source = args[1]
+                    sys.argv = ["-c", *args[2:]]
+                    exec(compile(source, "<launcher expression>", "exec"))
+            elif args[0] == "-":
+                os.environ["BFCL_PROJECT_ROOT"] = str(project)
+                sys.argv = ["-", *args[1:]]
+                exec(compile(sys.stdin.read(), "<launcher model probe>", "exec"))
+            elif args[0].endswith("benchmark_runtime/client.py"):
+                event("health", category=category, arguments=args)
+                assert value("--backend") == "bfcl"
+                assert int(value("--expect-pid")) > 0
+                expected = hashlib.sha256(Path("verl/benchmark_runtime/server.py").read_bytes()).hexdigest()
+                assert value("--expect-server-sha256") == expected
+                if os.environ.get("FAKE_OCCUPIED"):
+                    sys.argv = args
+                    runpy.run_path(args[0], run_name="__main__")
+            elif args[0] == "data/preprocess.py":
+                if "--bfcl-categories" in args:
+                    category = value("--bfcl-categories")
+                    output = path(value("--output-dir"))
+                    output.mkdir(parents=True, exist_ok=True)
+                    (output / "train.parquet").touch()
+                    (output / "test.parquet").touch()
+                    (output / "case_ids.json").write_text(json.dumps({category: [category + "_0"]}))
+                    event("preprocess", category=category)
+                elif "--bfcl-check-results" in args:
+                    assert (project / "result" / "generated.json").is_file()
+                    event("check_results", category=category)
+                elif "--bfcl-summarize-multi-turn" in args:
+                    event("summary", arguments=args)
+                    (path(value("--bfcl-summarize-multi-turn")) / "multi_turn_summary.json").write_text("{}")
+                else:
+                    raise AssertionError(args)
+            elif args[:2] == ["-m", "verl.trainer.main_ppo"]:
+                overrides = {}
+                for argument in args[2:]:
+                    if "=" in argument:
+                        key, setting = argument.split("=", 1)
+                        overrides[key.lstrip("+")] = setting
+                category = os.environ["TRAIN_CATEGORIES"]
+                event("train", category=category, overrides=overrides,
+                      model=os.environ["MODEL_PATH"], eval_categories=os.environ["EVAL_CATEGORIES"])
+                if category == os.environ.get("FAKE_FAIL_TRAIN"):
+                    event("train_failed", category=category)
+                    sys.exit(7)
+                output = path(overrides["trainer.post_train_eval.output_dir"])
+                output.mkdir(parents=True)
+                model = overrides["actor_rollout_ref.model.path"]
+
+                class Handler(BaseHTTPRequestHandler):
+                    def log_message(self, *unused):
+                        pass
+
+                    def do_GET(self):
+                        assert self.path == "/v1/models"
+                        body = json.dumps({"data": [{"id": model}]}).encode()
+                        self.send_response(200)
+                        self.end_headers()
+                        self.wfile.write(body)
+
+                    def do_POST(self):
+                        assert self.path == "/v1/completions"
+                        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                        assert body["model"] == model
+                        event("model_probe", category=category)
+                        self.send_response(200)
+                        self.end_headers()
+                        self.wfile.write(b'{"choices": [{"text": "Hello"}]}')
+
+                server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+                worker = threading.Thread(target=server.serve_forever, daemon=True)
+                worker.start()
+                settings = {
+                    "LOCAL_SERVER_ENDPOINT": "127.0.0.1",
+                    "REMOTE_OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
+                    "REMOTE_OPENAI_TOKENIZER_PATH": model,
+                }
+                connection = "".join(f"export {key}={shlex.quote(setting)}\n" for key, setting in settings.items())
+                (output / "server.env").write_text(connection, encoding="utf-8")
+                while not (output / "stop").exists() and not (output.parent / "abort_train").exists():
+                    time.sleep(0.05)
+                server.shutdown()
+                server.server_close()
+                event("train_stopped", category=category)
+            elif args[:3] == ["-m", "bfcl_eval", "generate"]:
+                event("generate", category=category, arguments=args)
+                if category == os.environ.get("FAKE_FAIL_GENERATE"):
+                    (project.parent / "abort_train").touch()
+                    sys.exit(9)
+                (project / "result").mkdir()
+                (project / "result" / "generated.json").write_text("{}")
+            elif args[:3] == ["-m", "bfcl_eval", "evaluate"]:
+                assert value("--test-category") == category
+                event("evaluate", category=category, arguments=args)
+                (project / "score").mkdir()
+            else:
+                raise AssertionError(args)
+        ''')
+
+    def launch(self, **extra_env):
+        overrides = [
+            "ttrl.reward_mode=bfcl", "ttrl.enable=True", "trainer.post_train_eval.enabled=True",
+            "actor_rollout_ref.model.path=wrong-model", "trainer.resume_mode=auto",
+            "data.train_files=shared-data", "trainer.default_local_dir=shared-checkpoint",
+            "actor_rollout_ref.actor.gradient_record.output_dir=shared-gradients",
+            "trainer.post_train_eval.output_dir=shared-serving",
+            "trainer.rollout_data_dir=shared-rollouts", "trainer.validation_data_dir=shared-validation",
+        ]
+        result = subprocess.run(
+            [self.bash, (ROOT / "examples/ttrl/Qwen2.5/aime.sh").as_posix(), *overrides],
+            cwd=ROOT, env=dict(self.env, **extra_env), text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+        )
+        return result, self.read_events()
+
+    def read_events(self):
+        if not self.events.exists():
+            return []
+        return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(self.events.glob("*.json"))]
+
+    def test_all_categories_use_independent_original_initialization_and_reject_reuse(self):
+        result, events = self.launch()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        trained = [entry for entry in events if entry["kind"] == "train"]
+        self.assertEqual([entry["category"] for entry in trained], list(self.categories))
+        for entry in trained:
+            category = entry["category"]
+            overrides = entry["overrides"]
+            self.assertEqual(overrides["actor_rollout_ref.model.path"], self.model.as_posix())
+            self.assertEqual(overrides["trainer.resume_mode"], "disable")
+            self.assertEqual(entry["eval_categories"], category)
+            child = self.suite / category
+            for key, suffix in (
+                ("data.train_files", "data/train.parquet"), ("data.val_files", "data/test.parquet"),
+                ("trainer.default_local_dir", "checkpoints"), ("hydra.run.dir", "hydra"),
+                ("actor_rollout_ref.actor.gradient_record.output_dir", "gradients"),
+                ("trainer.post_train_eval.output_dir", "post_train_eval"),
+                ("trainer.rollout_data_dir", "rollouts"), ("trainer.validation_data_dir", "validation"),
+            ):
+                expected = (child / suffix).resolve()
+                actual = overrides[key]
+                if os.name == "nt" and re.match(r"^/[a-zA-Z]/", actual):
+                    actual = actual[1] + ":" + actual[2:]
+                self.assertEqual(Path(actual).resolve(), expected, (category, key))
+            for kind in ("preprocess", "health", "model_probe", "generate", "check_results", "evaluate",
+                         "train_stopped", "runtime_stop"):
+                self.assertEqual(sum(item["kind"] == kind and item["category"] == category for item in events), 1)
+            if category != self.categories[-1]:
+                stopped = next(i for i, item in enumerate(events)
+                               if item["kind"] == "runtime_stop" and item["category"] == category)
+                next_category = self.categories[self.categories.index(category) + 1]
+                started = next(i for i, item in enumerate(events)
+                               if item["kind"] == "preprocess" and item["category"] == next_category)
+                self.assertLess(stopped, started)
+        self.assertEqual(events[-1]["kind"], "summary")
+        self.assertTrue((self.suite / "multi_turn_summary.json").is_file())
+        result, repeated = self.launch()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fresh RUN_ROOT", result.stdout)
+        self.assertEqual(events, repeated)
+
+    def test_training_failure_stops_before_starting_the_next_category(self):
+        result, events = self.launch(FAKE_FAIL_TRAIN=self.categories[0])
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual([event["category"] for event in events if event["kind"] == "train"], [self.categories[0]])
+        self.assertFalse(any(event["kind"] in ("generate", "summary") for event in events))
+        self.assertFalse((self.suite / self.categories[1]).exists())
+        self.assertFalse((self.suite / ".multi_turn_suite.lock").exists())
+
+    def test_seven_b_registry_default_follows_original_model_path(self):
+        model = self.root / "Qwen2.5-7B-Instruct"
+        model.mkdir()
+        self.env.pop("BFCL_MODEL")
+        result, events = self.launch(MODEL_PATH=model.as_posix(), FAKE_FAIL_TRAIN=self.categories[0])
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        trained = [event for event in events if event["kind"] == "train"]
+        self.assertEqual(len(trained), 1)
+        self.assertEqual(trained[0]["overrides"]["actor_rollout_ref.model.path"], model.as_posix())
+        configuration = (self.suite / self.categories[0] / "run.env").read_text(encoding="utf-8")
+        self.assertIn("export BFCL_MODEL=Qwen/Qwen2.5-7B-Instruct-FC", configuration)
+
+    def test_evaluation_failure_stops_the_suite_without_publishing_a_summary(self):
+        result, events = self.launch(FAKE_FAIL_GENERATE=self.categories[0])
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual([event["category"] for event in events if event["kind"] == "train"], [self.categories[0]])
+        self.assertFalse(any(event["kind"] in ("evaluate", "summary") for event in events))
+        self.assertFalse((self.suite / self.categories[1]).exists())
+
+    def test_foreign_runtime_identity_failure_leaves_the_unrelated_listener_running(self):
+        foreign_code = textwrap.dedent('''
+            import json, os, sys
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *unused): pass
+                def do_POST(self):
+                    request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                    result = {"version": 1, "id": request["id"], "result": {
+                        "backend": "bfcl", "pid": os.getpid(), "server_sha256": "foreign-code"}}
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(json.dumps(result).encode())
+            server = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+            print("ready", flush=True)
+            server.serve_forever()
+        ''')
+        foreign = subprocess.Popen(
+            [sys.executable, "-u", "-c", foreign_code, str(self.runtime_port)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        try:
+            self.assertEqual(foreign.stdout.readline().strip(), "ready")
+            result, events = self.launch(FAKE_OCCUPIED="1")
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Runtime identity mismatch", result.stdout)
+            self.assertIsNone(foreign.poll(), "The launcher terminated an unrelated runtime")
+            self.assertFalse(any(event["kind"] in ("train", "summary") for event in events))
+        finally:
+            foreign.terminate()
+            foreign.communicate(timeout=5)
 
 
 if __name__ == "__main__":

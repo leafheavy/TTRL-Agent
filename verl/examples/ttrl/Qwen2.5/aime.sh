@@ -1,4 +1,21 @@
 #!/bin/bash
+# The BFCL group is an experiment suite: each category gets a fresh process.
+# Concrete categories and config-only preflight retain the original entrypoint.
+BFCL_REWARD_MODE=
+BFCL_PREFLIGHT=False
+for override in "$@"; do
+  key=${override%%=*}
+  key=${key#+}; key=${key#+}
+  case "$key" in
+    ttrl.reward_mode) BFCL_REWARD_MODE=${override#*=} ;;
+    trainer.preflight_only) BFCL_PREFLIGHT=${override#*=} ;;
+  esac
+done
+if [ "${TRAIN_CATEGORIES:-}" = multi_turn ] && [ "$BFCL_REWARD_MODE" = bfcl ] && \
+   [ "${BFCL_PREFLIGHT,,}" != true ]; then
+  exec bash "$(dirname "${BASH_SOURCE[0]}")/bfcl_multi_turn.sh" "$@"
+fi
+
 #export VLLM_ATTENTION_BACKEND=XFORMERS
 unset VLLM_ATTENTION_BACKEND
 export VLLM_USE_V1=1
@@ -39,7 +56,7 @@ LOG_NAME="${DATE}-${EXPERIMENT}-${MODEL}-${ADVANTAGE}"
 OUTPUT_DIR="checkpoints/${WANDB_PROJECT}/${MODEL}/${DATE}/${EXPERIMENT}-${ADVANTAGE}-${TIME_TAG}"
 
 # ------------------------------------------------------------
-python -m verl.trainer.main_ppo \
+"${TRAIN_PYTHON:-python}" -m verl.trainer.main_ppo \
 --config-name='ppo_trainer_ttrl.yaml'\
   data.train_files=["$DATA_LOCAL_DIR/$TASK/train.parquet"] \
   data.val_files=["$DATA_LOCAL_DIR/$TASK/test.parquet"] \

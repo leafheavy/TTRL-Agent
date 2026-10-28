@@ -32,6 +32,76 @@ class Config(dict):
     __getattr__ = dict.__getitem__
 
 
+class TestActorOptimizerForeach(unittest.TestCase):
+    @staticmethod
+    def optimizer(module, config):
+        """Execute the worker's actual validation and AdamW construction."""
+        path = ROOT / "verl/workers/fsdp_workers.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        worker = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
+        method = next(node for node in worker.body if getattr(node, "name", None) == "_build_model_optimizer")
+        assignment = next(
+            node for node in method.body
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "optimizer_foreach" for target in node.targets
+            )
+        )
+        validation = next(
+            node for node in method.body
+            if isinstance(node, ast.If) and any(
+                isinstance(item, ast.Name) and item.id == "optimizer_foreach" for item in ast.walk(node.test)
+            )
+        )
+        construction = next(
+            node for node in ast.walk(method)
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "actor_optimizer" for target in node.targets
+            ) and isinstance(node.value, ast.Call)
+        )
+        namespace = {
+            "role": "actor", "optim_config": Config(lr=0.01, **config),
+            "actor_module_fsdp": module, "optim": torch.optim,
+        }
+        exec(compile(ast.Module(body=[assignment, validation, construction], type_ignores=[]), str(path), "exec"), namespace)
+        return namespace["actor_optimizer"]
+
+    def test_worker_forwards_auto_true_and_false_to_adamw(self):
+        for config, expected in (({}, None), ({"foreach": None}, None), ({"foreach": True}, True), ({"foreach": False}, False)):
+            with self.subTest(config=config):
+                optimizer = self.optimizer(nn.Linear(2, 1), config)
+                self.assertIs(optimizer.defaults["foreach"], expected)
+
+    def test_invalid_foreach_fails_before_optimizer_construction(self):
+        for value in ("False", "auto", 0, 1, [], {}):
+            with self.subTest(value=value), patch.object(torch.optim, "AdamW") as construction:
+                with self.assertRaisesRegex(ValueError, "actor.optim.foreach must be a boolean or null"):
+                    self.optimizer(nn.Linear(2, 1), {"foreach": value})
+                construction.assert_not_called()
+
+    def test_false_avoids_multi_tensor_path_and_preserves_adamw_updates(self):
+        torch.manual_seed(197)
+        low_memory = nn.Sequential(nn.Linear(3, 5), nn.Linear(5, 2)).double()
+        reference = copy.deepcopy(low_memory)
+        actual_optimizer = self.optimizer(low_memory, {"foreach": False, "weight_decay": 0.13})
+        reference_optimizer = self.optimizer(reference, {"foreach": True, "weight_decay": 0.13})
+        adamw = importlib.import_module("torch.optim.adamw")
+        for step in range(3):
+            for parameter, expected_parameter in zip(low_memory.parameters(), reference.parameters()):
+                gradient = torch.linspace(-0.7, 0.9, parameter.numel(), dtype=parameter.dtype).reshape_as(parameter)
+                parameter.grad = gradient + step * 0.03
+                expected_parameter.grad = parameter.grad.clone()
+            reference_optimizer.step()
+            with patch.object(adamw, "_multi_tensor_adamw", side_effect=AssertionError("Unexpected foreach allocation")):
+                actual_optimizer.step()
+            for parameter, expected_parameter in zip(low_memory.parameters(), reference.parameters()):
+                torch.testing.assert_close(parameter, expected_parameter, rtol=1e-12, atol=1e-12)
+                for key in ("step", "exp_avg", "exp_avg_sq"):
+                    torch.testing.assert_close(
+                        actual_optimizer.state[parameter][key], reference_optimizer.state[expected_parameter][key],
+                        rtol=1e-12, atol=1e-12,
+                    )
+
+
 class Tensors(dict):
     def __len__(self):
         return next(iter(self.values())).shape[0]
@@ -820,8 +890,12 @@ class TestPairedRandomBaselines(unittest.TestCase):
                 expected_metrics = ordinary.update_policy(sample_batch())
                 expected_rng = torch.random.get_rng_state().clone()
                 torch.manual_seed(101)
-                with patch.object(diagnostics, "random_gradient_statistics", wraps=diagnostics.random_gradient_statistics) as random:
-                    with patch.object(recorded, "_backward_micro_batches", wraps=recorded._backward_micro_batches) as backward:
+                with patch.object(
+                    diagnostics, "random_gradient_statistics", wraps=diagnostics.random_gradient_statistics
+                ) as random:
+                    with patch.object(
+                        recorded, "_backward_micro_batches", wraps=recorded._backward_micro_batches
+                    ) as backward:
                         actual_metrics = recorded.update_policy(batch)
                 self.assertEqual(random.call_count, int(random_enabled))
                 self.assertEqual(backward.call_count, 3 + int(shuffled_enabled))
@@ -880,7 +954,10 @@ class TestTrajectoryBaselineWiring(unittest.TestCase):
             actor.config.ppo_epochs = 2
         recorded.gradient_record_config.update(
             enabled=True, interval=10, single_step={"enabled": False},
-            trajectory={"enabled": True}, baselines={"enabled": True, "seed": 23},
+            trajectory={"enabled": True}, baselines={
+                "enabled": True, "seed": 23,
+                "shuffled_labels": {"enabled": True}, "random_direction": {"enabled": False},
+            },
         )
         for step, learning_rate in ((2, 0.003), (3, 0.008)):
             batch = TestPairedRandomBaselines.baseline_batch(step)
@@ -900,7 +977,10 @@ class TestTrajectoryBaselineWiring(unittest.TestCase):
             expected_metrics = ordinary.update_policy(sample_batch(step))
             expected_rng = torch.random.get_rng_state().clone()
             torch.manual_seed(200 + step)
-            with patch.object(recorded, "_record_policy_gradient", side_effect=AssertionError("legacy snapshot ran")):
+            with patch.object(recorded, "_record_policy_gradient", side_effect=AssertionError("legacy snapshot ran")), \
+                    patch.object(torch, "save", side_effect=AssertionError("checkpoint or batch archive written")), \
+                    patch.object(diagnostics.OptimizationTrajectory, "_random_chunks",
+                                 side_effect=AssertionError("disabled random direction ran")):
                 with patch.object(
                     recorded, "_backward_micro_batches", wraps=recorded._backward_micro_batches
                 ) as backward:
@@ -913,6 +993,7 @@ class TestTrajectoryBaselineWiring(unittest.TestCase):
             for key, value in originals.items():
                 self.assertTrue(torch.equal(batch.batch[key], value), key)
             trajectory = recorded.optimization_trajectory
+            self.assertFalse(hasattr(trajectory, "random_displacement"))
             self.assertEqual(trajectory.updates, (step - 1) * 4)
             for parameters, optimizer_state, reference in (
                 (trajectory.supervised_parameters, trajectory.supervised_optimizer_state, supervised),
@@ -934,9 +1015,10 @@ class TestTrajectoryBaselineWiring(unittest.TestCase):
         self.assertEqual(final["updates"], 8)
         self.assertEqual(final["start_update"], "step_000002_epoch_000_minibatch_0000")
         self.assertEqual(final["end_update"], "step_000003_epoch_001_minibatch_0001")
-        self.assertEqual(set(final["baselines"]), {"shuffled_labels", "random_update"})
+        self.assertEqual(set(final["baselines"]), {"shuffled_labels"})
         self.assertFalse(list((self.root / "trajectory").glob("step_*.json")))
         self.assertFalse(list((self.root / "trajectory").rglob("*.bin")))
+        self.assertTrue(all(path.suffix == ".json" for path in (self.root / "trajectory").rglob("*") if path.is_file()))
         self.assertTrue(any(
             not torch.equal(left, right)
             for left, right in zip(trajectory.supervised_parameters, trajectory.shuffled_parameters)

@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import os
 from copy import deepcopy
@@ -12,6 +13,13 @@ BFCL_INPUT_FIELDS = (
     "involved_classes",
     "missed_function",
     "observable_state",
+)
+
+MULTI_TURN_COLUMNS = (
+    ("multi_turn_base", "Base (%)"),
+    ("multi_turn_miss_func", "Miss Func (%)"),
+    ("multi_turn_miss_param", "Miss Param (%)"),
+    ("multi_turn_long_context", "Long Context (%)"),
 )
 
 
@@ -158,6 +166,75 @@ def check_bfcl_result_ids(case_ids, result_dir):
             )
 
 
+def summarize_bfcl_multi_turn(run_root, model, label):
+    """Report four independently adapted models using official score counts.
+
+    Average is the unweighted mean of the four category accuracies, even when
+    filtering produces different category sizes. It is not BFCL Overall Acc.
+    """
+    run_root = Path(run_root)
+    rows = []
+    for category, _ in MULTI_TURN_COLUMNS:
+        child = run_root / category
+        cases = json.loads((child / "data" / "case_ids.json").read_text(encoding="utf-8"))
+        if set(cases) != {category} or not isinstance(cases[category], list) or not cases[category]:
+            raise ValueError(f"Expected exactly the selected {category} cases in {child}")
+        ids = cases[category]
+        if not all(isinstance(case_id, str) and case_id.startswith(category + "_") for case_id in ids):
+            raise ValueError(f"Invalid case IDs for {category}")
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"Invalid or duplicate case IDs for {category}")
+        check_bfcl_result_ids(cases, child / "eval" / "result")
+        # Accept the installed BFCL data version; do not relabel v4 as v3.
+        paths = list((child / "eval" / "score" / model.replace("/", "_")).rglob(
+            f"BFCL_v*_{category}_score.json"
+        ))
+        if len(paths) != 1:
+            raise ValueError(f"Expected one official score file for {category}, got {paths}")
+        with paths[0].open(encoding="utf-8") as handle:
+            header = json.loads(next(line for line in handle if line.strip()))
+        correct, total = header["correct_count"], header["total_count"]
+        if (
+            type(correct) is not int or type(total) is not int
+            or total != len(ids) or not 0 <= correct <= total
+        ):
+            raise ValueError(f"Official score counts disagree with selected cases for {category}: {header}")
+        rows.append({
+            "category": category, "correct_count": correct, "total_count": total,
+            "accuracy": correct / total, "score_file": str(paths[0]), "run_root": str(child),
+        })
+    average = sum(row["accuracy"] for row in rows) / len(rows)
+    summary = {
+        "label": label, "model_registry": model,
+        "setting": "independent_per_category_adaptation",
+        "average_accuracy": average, "categories": rows,
+    }
+    (run_root / "multi_turn_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    columns = ["Model", "Average (%)"] + [title for _, title in MULTI_TURN_COLUMNS]
+    values = [label, f"{100 * average:.2f}"] + [f"{100 * row['accuracy']:.2f}" for row in rows]
+    with (run_root / "multi_turn_summary.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        writer.writerow(values)
+    # The first cell can contain user-provided names; escape Markdown syntax.
+    md_values = [values[0].replace("|", "\\|").replace("\n", " ")] + values[1:]
+    table = "\n".join((
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join(["---"] + ["---:"] * (len(columns) - 1)) + " |",
+        "| " + " | ".join(md_values) + " |",
+    ))
+    note = (
+        "各类别从同一原始模型独立训练，在各自同批 case 上重新生成并使用官方评分。"
+        "Average 是四类准确率的算术平均；这是四个类别专用模型的汇总，不是单一模型的 BFCL 总分。"
+    )
+    (run_root / "multi_turn_summary.md").write_text(table + "\n\n" + note + "\n", encoding="utf-8")
+    print(table)
+    print(f"Summary: {run_root / 'multi_turn_summary.md'}")
+    return summary
+
+
 def make_map_fn(split, source=None):
     def process_fn(example, idx):
         if source is None:
@@ -195,6 +272,9 @@ if __name__ == "__main__":
         "--bfcl-categories", help="BFCL local Agent categories, comma-separated; accepts multi_turn"
     )
     bfcl_input.add_argument("--bfcl-check-results", help="Check generated result IDs against a case_ids.json manifest")
+    bfcl_input.add_argument("--bfcl-summarize-multi-turn", metavar="RUN_ROOT", help="Summarize four independent category runs")
+    parser.add_argument("--bfcl-model", default="Qwen/Qwen2.5-3B-Instruct-FC", help="Official BFCL model registry key")
+    parser.add_argument("--bfcl-run-label", default="TTRL", help="Display label for the multi-turn summary row")
     parser.add_argument("--bfcl-result-dir", help="BFCL generated result directory, used with --bfcl-check-results")
     parser.add_argument("--bfcl-val-json")
     parser.add_argument("--bfcl-consensus", choices=("calls", "observations", "state"), default="observations")
@@ -210,6 +290,9 @@ if __name__ == "__main__":
         case_ids = json.loads(Path(args.bfcl_check_results).read_text(encoding="utf-8"))
         check_bfcl_result_ids(case_ids, args.bfcl_result_dir)
         print(f"BFCL result IDs match: {sum(map(len, case_ids.values()))} cases")
+        raise SystemExit(0)
+    if args.bfcl_summarize_multi_turn:
+        summarize_bfcl_multi_turn(args.bfcl_summarize_multi_turn, args.bfcl_model, args.bfcl_run_label)
         raise SystemExit(0)
     if args.bfcl_train_json or args.bfcl_categories:
         from bfcl_eval.utils import load_file
