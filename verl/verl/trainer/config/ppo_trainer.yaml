@@ -76,6 +76,9 @@ data:
   # Batch size sampled for one training iteration of different RL algorithms.
   train_batch_size: 1024
 
+  # null retains BFCL tail cases and preserves drop_last=True for other tasks.
+  drop_last: null
+
   # Batch size used during validation. Can be null.
   val_batch_size: null
 

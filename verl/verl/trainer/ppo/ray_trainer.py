@@ -574,6 +574,17 @@ class RayPPOTrainer:
 
         print("[validate_config] All configuration checks passed successfully!")
 
+    def _training_drop_last(self):
+        """Retain BFCL cases by default without changing existing math recipes."""
+        drop_last = self.config.data.get("drop_last")
+        if drop_last is not None and not isinstance(drop_last, bool):
+            raise ValueError("data.drop_last must be a boolean or null")
+        ttrl = self.config.get("ttrl", {})
+        bfcl_training = (
+            ttrl.get("enable", False) and ttrl.get("reward_mode", "math") == "bfcl"
+        ) or self.config.get("bfcl_supervised", {}).get("enabled", False)
+        return not bfcl_training if drop_last is None else drop_last
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
         """
         Creates the train and validation dataloaders.
@@ -602,7 +613,7 @@ class RayPPOTrainer:
             dataset=self.train_dataset,
             batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
             num_workers=self.config.data.get("dataloader_num_workers", 8),
-            drop_last=True,
+            drop_last=self._training_drop_last(),
             collate_fn=collate_fn,
             sampler=train_sampler,
         )
@@ -660,15 +671,36 @@ class RayPPOTrainer:
             return
         batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
         sampler = self.train_dataloader.sampler
+        cases = len(self.train_dataset)
+        tail = cases % batch_size
+        drop_last = getattr(self.train_dataloader, "drop_last", self._training_drop_last())
         if (
-            len(self.train_dataset) % batch_size or len(sampler) != len(self.train_dataset)
+            (drop_last and tail) or len(sampler) != cases
             or getattr(sampler, "replacement", False)
         ):
             raise ValueError(
                 "BFCL training requires every case once per epoch without a dropped tail batch: "
-                f"{len(self.train_dataset)} cases, batch_size={batch_size}. "
-                "Choose a batch size that divides the selected case count."
+                f"{cases} cases, batch_size={batch_size}. "
+                "Set data.drop_last=False to retain the tail batch."
             )
+        if bfcl_training:
+            if tail and self.config.actor_rollout_ref.actor.strategy not in ("fsdp", "fsdp2"):
+                raise ValueError("BFCL tail batches currently require an FSDP/FSDP2 actor")
+            # DataProto dispatch and sequence balancing partition by the entire
+            # worker group, before any sequence-parallel all-gather. Do not pad
+            # with duplicate cases or count synthetic rollouts as observations.
+            workers = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+            rollout_n = self.config.actor_rollout_ref.rollout.n
+            batch_cases = {min(batch_size, cases)}
+            if tail:
+                batch_cases.add(tail)
+            for actual_cases in batch_cases:
+                if actual_cases * rollout_n % workers:
+                    raise ValueError(
+                        "BFCL full and tail rollout batches must divide evenly across actor workers: "
+                        f"{actual_cases} cases * {rollout_n} rollouts, {workers} workers. "
+                        "Choose a compatible rollout count or worker count; cases will not be duplicated."
+                    )
         if not dynamic.get("enabled", False):
             return
         steps = self.config.trainer.get("total_training_steps")
@@ -1148,6 +1180,7 @@ class RayPPOTrainer:
                 "batches_per_epoch": len(self.train_dataloader),
                 "rollouts_per_batch": self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
                 * self.config.actor_rollout_ref.rollout.n,
+                "rollouts_per_epoch": len(self.train_dataset) * self.config.actor_rollout_ref.rollout.n,
             }
             with open(os.path.join(local_global_step_folder, "epoch_failure_weights.json"), "w") as handle:
                 json.dump(failure_state, handle, indent=2)
@@ -1207,11 +1240,16 @@ class RayPPOTrainer:
             partial_batches = state.get("batches_in_epoch")
             if (
                 state.get("batches_per_epoch") != batches or state.get("rollouts_per_batch") != rollouts
+                or state.get("rollouts_per_epoch", batches * rollouts)
+                != len(self.train_dataset) * self.config.actor_rollout_ref.rollout.n
                 or isinstance(partial_batches, bool) or not isinstance(partial_batches, int)
                 or not 0 <= partial_batches < batches
             ):
                 raise ValueError("Dynamic failure weighting resume requires the original data and rollout schedule")
             controller.load_state_dict(state["controller"])
+            # Only the last batch can be short; it is committed and counters
+            # reset by _finish_failure_epoch before checkpointing. A partial
+            # epoch therefore always consists of full-sized prefix batches.
             if (
                 controller.completed_epochs * batches + partial_batches != self.global_steps
                 or state["controller"]["total_rollouts"] != partial_batches * rollouts

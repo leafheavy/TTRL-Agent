@@ -380,8 +380,15 @@ class DataParallelPPOActor(BasePPOActor):
     def _backward_micro_batches(
         self, micro_batches, temperature, metrics, *, policy_only=False, advantages_key="advantages"
     ):
-        """Reuse the training objective and accumulation for an optional policy-only pass."""
-        for data in micro_batches:
+        """Reuse the objective, averaging over the actual minibatch's rollouts."""
+        micro_batch_sizes = [
+            (data.batch if isinstance(data, DataProto) else data)["response_mask"].shape[0]
+            for data in micro_batches
+        ]
+        batch_size = sum(micro_batch_sizes)
+        if batch_size == 0:
+            raise ValueError("Actor update requires a nonempty minibatch")
+        for data, micro_batch_size in zip(micro_batches, micro_batch_sizes):
             micro_batch_metrics = {}
             if isinstance(data, DataProto):
                 data = {**data.batch.to(get_device_id()), **data.non_tensor_batch}
@@ -437,10 +444,9 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                     micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item()
                     micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
-            if self.config.use_dynamic_bsz:
-                loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
-            else:
-                loss = policy_loss / self.gradient_accumulation
+            # Keep the configured microbatch loss reduction. Normalize by real
+            # rollout counts so short minibatches/microbatches retain their mean.
+            loss = policy_loss * (micro_batch_size / batch_size)
             loss.backward()
             if not policy_only:
                 micro_batch_metrics.update(
@@ -484,7 +490,7 @@ class DataParallelPPOActor(BasePPOActor):
             "clip_ratio_low": self.config.clip_ratio_low,
             "clip_ratio_high": self.config.clip_ratio_high,
             "clip_ratio_c": self.config.get("clip_ratio_c", 3.0),
-            "mini_batch_size_per_rank": self.config.ppo_mini_batch_size,
+            "mini_batch_size_per_rank": tensors["response_mask"].shape[0],
             "micro_batch_size": self.config.ppo_micro_batch_size_per_gpu,
             "dynamic_bsz": self.config.use_dynamic_bsz,
         }
@@ -692,9 +698,12 @@ class DataParallelPPOActor(BasePPOActor):
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         if has_multi_modal_inputs:
-            num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
             non_tensor_select_keys = ["multi_modal_inputs"]
-            dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
+            selected = data.select(select_keys, non_tensor_select_keys)
+            dataloader = [
+                selected[start : start + self.config.ppo_mini_batch_size]
+                for start in range(0, len(selected), self.config.ppo_mini_batch_size)
+            ]
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
@@ -724,21 +733,19 @@ class DataParallelPPOActor(BasePPOActor):
                             mb_dict["multi_modal_inputs"] = current_mm_inputs_list
                             micro_batches.append(mb_dict)
                     else:
-                        self.gradient_accumulation = (
-                            self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                        )
-                        num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
-                        micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+                        selected = data.select(select_keys, non_tensor_select_keys)
+                        micro_batches = [
+                            selected[start : start + self.config.ppo_micro_batch_size_per_gpu]
+                            for start in range(0, len(selected), self.config.ppo_micro_batch_size_per_gpu)
+                        ]
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
                 else:
-                    self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    )
                     # split batch into micro_batches
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
+                self.gradient_accumulation = len(micro_batches)
                 if record_gradient:
                     self._record_policy_gradient(
                         micro_batches, mini_batch, temperature, gradient_metadata, epoch, batch_idx

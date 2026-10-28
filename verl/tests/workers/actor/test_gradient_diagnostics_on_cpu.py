@@ -121,8 +121,21 @@ class Batch:
         self.batch, self.non_tensor_batch = Tensors(tensors), {}
         self.meta_info = metadata or {}
 
-    def select(self, batch_keys):
-        return Batch({key: self.batch[key] for key in batch_keys}, self.meta_info)
+    def __len__(self):
+        return len(self.batch)
+
+    def __getitem__(self, item):
+        selected = Batch({key: value[item] for key, value in self.batch.items()}, self.meta_info)
+        selected.non_tensor_batch = {key: value[item] for key, value in self.non_tensor_batch.items()}
+        return selected
+
+    def select(self, batch_keys, non_tensor_batch_keys=None):
+        selected = Batch({key: self.batch[key] for key in batch_keys}, self.meta_info)
+        selected.non_tensor_batch = {
+            key: value for key, value in self.non_tensor_batch.items()
+            if non_tensor_batch_keys is None or key in non_tensor_batch_keys
+        }
+        return selected
 
 
 def source_definitions(path, names, namespace, methods=None):
@@ -287,6 +300,108 @@ class TestPolicyGradientRecording(unittest.TestCase):
         self.assertTrue(torch.equal(rng_after, torch.random.get_rng_state()))
         self.assertEqual(ordinary_metrics, recorded_metrics)
         self.assertFalse((self.root / "off").exists())
+
+    @staticmethod
+    def sized_batch(batch, size):
+        indices = torch.arange(size) % len(batch)
+        return Batch({key: value[indices].clone() for key, value in batch.batch.items()}, copy.deepcopy(batch.meta_info))
+
+    def test_tail_gradients_and_adam_moments_match_a_single_actual_batch(self):
+        for size in (1, 3, 5):
+            for dynamic in (False, True):
+                with self.subTest(size=size, dynamic=dynamic):
+                    actual = make_actor(False, self.root / "actual")
+                    reference = make_actor(False, self.root / "reference")
+                    for actor in (actual, reference):
+                        actor.actor_module.double()
+                        actor.actor_module[1].p = 0
+                        actor.config.grad_clip = 1e6
+                    actual.config.ppo_mini_batch_size = 8
+                    actual.config.use_dynamic_bsz = dynamic
+                    actual.gradient_accumulation = 4  # Nominal 8/2; wrong for this tail.
+                    reference.gradient_accumulation = 1
+                    batch = self.sized_batch(sample_batch(), size)
+                    for key, value in batch.batch.items():
+                        if value.is_floating_point():
+                            batch.batch[key] = value.double()
+                    # Equal valid lengths isolate accumulation from the configured
+                    # within-microbatch token reduction.
+                    batch.batch["response_mask"].fill_(1)
+                    micro_batches = [dict(micro) for micro in batch.batch.split(2)]
+                    actual._backward_micro_batches(micro_batches, 1.0, {})
+                    reference._backward_micro_batches([dict(batch.batch)], 1.0, {})
+                    for parameter, expected in zip(actual.actor_module.parameters(), reference.actor_module.parameters()):
+                        # masked_mean keeps an epsilon in each micro loss's
+                        # denominator, so differently split means differ slightly.
+                        torch.testing.assert_close(parameter.grad, expected.grad, rtol=1e-8, atol=1e-10)
+                    actual._optimizer_step()
+                    reference._optimizer_step()
+                    for parameter, expected in zip(actual.actor_module.parameters(), reference.actor_module.parameters()):
+                        torch.testing.assert_close(parameter, expected, rtol=1e-8, atol=1e-10)
+                        for key in ("step", "exp_avg", "exp_avg_sq"):
+                            torch.testing.assert_close(
+                                actual.actor_optimizer.state[parameter][key], reference.actor_optimizer.state[expected][key],
+                                rtol=1e-8, atol=1e-10,
+                            )
+
+    def test_update_policy_retains_a_small_last_minibatch(self):
+        actual = make_actor(False, self.root / "actual")
+        reference = make_actor(False, self.root / "reference")
+        batch = self.sized_batch(sample_batch(), 5)
+        batch.batch["response_mask"].fill_(1)
+        for actor in (actual, reference):
+            actor.actor_module[1].p = 0
+            actor.config.grad_clip = 1e6
+        reference.config.ppo_micro_batch_size_per_gpu = 4
+        expected_norms = []
+        for start, stop in ((0, 4), (4, 5)):
+            reference.config.ppo_mini_batch_size = stop - start
+            expected_norms.extend(reference.update_policy(batch[start:stop])["actor/grad_norm"])
+        metrics = actual.update_policy(batch)
+        self.assertEqual(len(metrics["actor/grad_norm"]), 2)
+        np.testing.assert_allclose(metrics["actor/grad_norm"], expected_norms, rtol=1e-6, atol=1e-7)
+        for parameter, expected in zip(actual.actor_module.parameters(), reference.actor_module.parameters()):
+            torch.testing.assert_close(parameter, expected, rtol=1e-6, atol=1e-7)
+            for key in ("step", "exp_avg", "exp_avg_sq"):
+                torch.testing.assert_close(
+                    actual.actor_optimizer.state[parameter][key], reference.actor_optimizer.state[expected][key],
+                    rtol=1e-6, atol=1e-7,
+                )
+
+    def test_multimodal_tail_slicing_retains_all_samples(self):
+        actor = make_actor(False, self.root / "multimodal")
+        batch = self.sized_batch(sample_batch(), 3)
+        batch.non_tensor_batch["multi_modal_inputs"] = np.array([{} for _ in range(3)], dtype=object)
+        with patch.object(actor, "_backward_micro_batches", wraps=actor._backward_micro_batches) as backward:
+            metrics = actor.update_policy(batch)
+        self.assertEqual(len(metrics["actor/grad_norm"]), 1)
+        self.assertEqual([len(micro) for micro in backward.call_args.args[0]], [2, 1])
+
+    def test_tail_paired_and_shuffled_diagnostics_preserve_actual_update(self):
+        ordinary = make_actor(False, self.root / "tail_off")
+        recorded = make_actor(True, self.root / "tail_on", mode="paired")
+        recorded.gradient_record_config.update(
+            single_step={"enabled": True}, trajectory={"enabled": True},
+            baselines={"enabled": True, "shuffled_labels": {"enabled": True},
+                       "random_direction": {"enabled": False}},
+        )
+        batch = self.sized_batch(paired_batch(), 3)
+        batch.batch["diagnostic_shuffled_advantages"] = batch.batch["advantages"].flip(0).clone()
+        torch.manual_seed(123)
+        expected_metrics = ordinary.update_policy(batch)
+        expected_rng = torch.random.get_rng_state()
+        torch.manual_seed(123)
+        metrics = recorded.update_policy(batch)
+        self.assertEqual(metrics, expected_metrics)
+        self.assertTrue(torch.equal(expected_rng, torch.random.get_rng_state()))
+        for actual, expected in zip(recorded.actor_module.parameters(), ordinary.actor_module.parameters()):
+            self.assertTrue(torch.equal(actual, expected))
+            for key in ("step", "exp_avg", "exp_avg_sq"):
+                self.assertTrue(torch.equal(recorded.actor_optimizer.state[actual][key],
+                                            ordinary.actor_optimizer.state[expected][key]))
+        report = json.loads(next((self.root / "tail_on").glob("step_*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(report["objective"]["mini_batch_size_per_rank"], 3)
+        self.assertEqual(recorded.optimization_trajectory.updates, 1)
 
     def test_saved_gradient_excludes_kl_entropy_and_gradient_clipping(self):
         reference = make_actor(False, self.root / "reference")
