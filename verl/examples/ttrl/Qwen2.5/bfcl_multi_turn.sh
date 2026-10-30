@@ -182,6 +182,9 @@ PY
   "$BFCL_PYTHON" -m bfcl_eval evaluate --model "$BFCL_MODEL" \
     --test-category "$category" --partial-eval 2>&1 | tee "$child_root/eval/evaluate.log"
   touch "$child_root/post_train_eval/stop"
+  # main_ppo waits for its Ray/vLLM children to exit; a cleanup failure aborts
+  # the suite here instead of loading the next category on top of old workers.
+  echo "[multi_turn] Releasing $category training workers."
   wait "$train_pid"
   train_pid=
   kill "$runtime_pid"

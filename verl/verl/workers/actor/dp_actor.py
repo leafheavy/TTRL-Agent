@@ -32,7 +32,7 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
-from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_, load_fsdp_optimizer, offload_fsdp_optimizer
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
@@ -52,11 +52,14 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class DataParallelPPOActor(BasePPOActor):
-    def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(
+        self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None, optimizer_offload=False
+    ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self._is_offload_optimizer = optimizer_offload
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         if torch.distributed.get_rank() == 0:
@@ -285,7 +288,16 @@ class DataParallelPPOActor(BasePPOActor):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
         else:
-            self.actor_optimizer.step()
+            # Keep Adam states on CPU throughout forward/backward, including
+            # diagnostic updates, and load them only for the optimizer step.
+            try:
+                if self._is_offload_optimizer:
+                    load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+                self.actor_optimizer.step()
+            finally:
+                if self._is_offload_optimizer:
+                    # Diagnostic branches may snapshot the CPU state immediately.
+                    offload_fsdp_optimizer(optimizer=self.actor_optimizer, non_blocking=False)
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)

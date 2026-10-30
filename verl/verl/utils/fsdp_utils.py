@@ -197,7 +197,8 @@ def load_fsdp2_model_to_gpu(model):
 
 
 @torch.no_grad()
-def offload_fsdp_optimizer(optimizer):
+def offload_fsdp_optimizer(optimizer, *, non_blocking=True):
+    """Move optimizer states to CPU; block when the caller needs to read them immediately."""
     if not optimizer.state:
         return
     for param_group in optimizer.param_groups:
@@ -205,7 +206,7 @@ def offload_fsdp_optimizer(optimizer):
             state = optimizer.state[param]
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
-                    state[key] = value.to("cpu", non_blocking=True)
+                    state[key] = value.to("cpu", non_blocking=non_blocking)
 
 
 @torch.no_grad()

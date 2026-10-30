@@ -624,7 +624,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.actor.use_remove_padding = use_remove_padding
                 self.config.actor.use_fused_kernels = use_fused_kernels
             self.actor = DataParallelPPOActor(
-                config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=self.config.actor,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                optimizer_offload=self._is_offload_optimizer,
             )
 
         if self._is_rollout:
@@ -683,8 +686,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)

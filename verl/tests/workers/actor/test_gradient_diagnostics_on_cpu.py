@@ -13,6 +13,7 @@ import math
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -178,6 +179,9 @@ def actor_class():
         "FSDPModule": type("FSDP2Stub", (), {}),
     }
     source_definitions(
+        ROOT / "verl/utils/fsdp_utils.py", {"load_fsdp_optimizer", "offload_fsdp_optimizer"}, namespace
+    )
+    source_definitions(
         ROOT / "verl/workers/actor/dp_actor.py",
         {"DataParallelPPOActor"},
         namespace,
@@ -220,6 +224,7 @@ def make_actor(enabled, directory, *, regularizers=True, mode=None):
     actor = Actor()
     actor.actor_module = module
     actor.actor_optimizer = torch.optim.AdamW(module.parameters(), lr=0.01)
+    actor._is_offload_optimizer = False
     actor.device_name = "cpu"
     actor.ulysses_sequence_parallel_size = 1
     actor.gradient_record_config = {"enabled": enabled, "output_dir": str(directory), "interval": 1}
@@ -1178,6 +1183,207 @@ class TestTrajectoryBaselineWiring(unittest.TestCase):
                 record = json.loads(next(directory.glob("trajectory_step_*.json")).read_text(encoding="utf-8"))
                 expected = {"shuffled_labels"} if shuffled_enabled else {"random_update"}
                 self.assertEqual(set(record["baselines"]), expected)
+
+
+class TestActorOptimizerOffload(unittest.TestCase):
+    """Exercise real AdamW with CPU transfer helpers and tracked residency.
+
+    Event assertions cover scheduling, not CUDA memory or asynchronous copies.
+    """
+
+    def setUp(self):
+        TestPolicyGradientRecording.setUp(self)
+
+    @contextmanager
+    def tracked_residency(self, actor, *, load_error=None, step_error=None):
+        events = []
+        resident = False
+        namespace = Actor._optimizer_step.__globals__
+        original_load = namespace["load_fsdp_optimizer"]
+        original_offload = namespace["offload_fsdp_optimizer"]
+        original_backward = actor._backward_micro_batches
+        original_step = actor.actor_optimizer.step
+
+        def load(optimizer, device_id):
+            nonlocal resident
+            self.assertIs(optimizer, actor.actor_optimizer)
+            self.assertFalse(resident)
+            resident = True
+            events.append("load")
+            if load_error is not None:
+                raise load_error
+            original_load(optimizer, device_id)
+
+        def offload(optimizer, *, non_blocking=True):
+            nonlocal resident
+            self.assertIs(optimizer, actor.actor_optimizer)
+            self.assertFalse(non_blocking, "CPU diagnostic snapshots must see completed copies")
+            events.append("offload")
+            original_offload(optimizer, non_blocking=non_blocking)
+            resident = False
+
+        def backward(*args, **kwargs):
+            self.assertFalse(resident, "Adam state must remain offloaded throughout backward")
+            result = original_backward(*args, **kwargs)
+            events.append("backward")
+            return result
+
+        def step():
+            self.assertEqual(resident, actor._is_offload_optimizer)
+            events.append("step")
+            if step_error is not None:
+                raise step_error
+            return original_step()
+
+        with patch.dict(namespace, load_fsdp_optimizer=load, offload_fsdp_optimizer=offload), \
+                patch.object(actor, "_backward_micro_batches", side_effect=backward), \
+                patch.object(actor.actor_optimizer, "step", side_effect=step):
+            try:
+                yield events
+            finally:
+                self.assertFalse(resident, "Optimizer state was not offloaded after the step")
+
+    def assert_training_equal(self, actual, expected):
+        verifier = TestOptimizationTrajectory()
+        verifier.assert_state_equal(actual.actor_module.state_dict(), expected.actor_module.state_dict())
+        verifier.assert_state_equal(actual.actor_optimizer.state_dict(), expected.actor_optimizer.state_dict())
+        for state in actual.actor_optimizer.state.values():
+            for value in state.values():
+                if isinstance(value, torch.Tensor):
+                    self.assertEqual(value.device.type, "cpu")
+
+    def test_three_delayed_load_updates_match_eager_load_parameters_moments_rng_and_metrics(self):
+        reference = make_actor(False, self.root / "eager")
+        actual = make_actor(False, self.root / "delayed")
+        actual._is_offload_optimizer = True
+        namespace = Actor._optimizer_step.__globals__
+        for step, learning_rate in enumerate((0.01, 0.003, 0.008), start=1):
+            for actor in (reference, actual):
+                actor.actor_optimizer.param_groups[0]["lr"] = learning_rate
+            # The old worker loaded before the whole forward/backward pass.
+            namespace["load_fsdp_optimizer"](reference.actor_optimizer, "cpu")
+            torch.manual_seed(200 + step)
+            expected_metrics = reference.update_policy(sample_batch(step))
+            expected_rng = torch.random.get_rng_state().clone()
+            namespace["offload_fsdp_optimizer"](reference.actor_optimizer)
+            torch.manual_seed(200 + step)
+            with self.tracked_residency(actual) as events:
+                actual_metrics = actual.update_policy(sample_batch(step))
+            self.assertEqual(events, ["backward", "load", "step", "offload"])
+            self.assert_training_equal(actual, reference)
+            self.assertEqual(actual_metrics, expected_metrics)
+            self.assertTrue(torch.equal(torch.random.get_rng_state(), expected_rng))
+            for state in actual.actor_optimizer.state.values():
+                self.assertEqual(state["step"].item(), step)
+
+    def test_every_minibatch_and_ppo_epoch_loads_only_after_gradient_accumulation(self):
+        actor = make_actor(False, self.root / "multiple_updates")
+        actor._is_offload_optimizer = True
+        actor.config.ppo_mini_batch_size = 2
+        actor.config.ppo_micro_batch_size_per_gpu = 1
+        actor.config.ppo_epochs = 2
+        with self.tracked_residency(actor) as events:
+            actor.update_policy(sample_batch())
+        self.assertEqual(events, ["backward", "load", "step", "offload"] * 4)
+        for state in actor.actor_optimizer.state.values():
+            self.assertEqual(state["step"].item(), 4)
+
+    def test_offload_disabled_does_not_transfer_optimizer_states(self):
+        actor = make_actor(False, self.root / "disabled")
+        with self.tracked_residency(actor) as events:
+            actor.update_policy(sample_batch())
+        self.assertEqual(events, ["backward", "step"])
+
+    def test_nonfinite_gradients_skip_update_without_loading_adam_states(self):
+        actor = make_actor(False, self.root / "nonfinite")
+        actor._is_offload_optimizer = True
+        actor.update_policy(sample_batch())
+        original_state = copy.deepcopy(actor.actor_optimizer.state_dict())
+        for value in (float("nan"), float("inf")):
+            with self.subTest(value=value):
+                for parameter in actor.actor_module.parameters():
+                    parameter.grad = torch.full_like(parameter, value)
+                with self.tracked_residency(actor) as events:
+                    norm = actor._optimizer_step()
+                self.assertFalse(torch.isfinite(norm))
+                self.assertEqual(events, [])
+                TestOptimizationTrajectory().assert_state_equal(actor.actor_optimizer.state_dict(), original_state)
+                self.assertTrue(all(parameter.grad is None for parameter in actor.actor_module.parameters()))
+
+    def test_failed_optimizer_step_or_partial_reload_still_offloads_states(self):
+        for failure in ("step_error", "load_error"):
+            with self.subTest(failure=failure):
+                actor = make_actor(False, self.root / failure)
+                actor._is_offload_optimizer = True
+                actor.update_policy(sample_batch())
+                original_parameters = copy.deepcopy(actor.actor_module.state_dict())
+                original_state = copy.deepcopy(actor.actor_optimizer.state_dict())
+                for parameter in actor.actor_module.parameters():
+                    parameter.grad = torch.ones_like(parameter)
+                with self.tracked_residency(actor, **{failure: RuntimeError(failure)}) as events:
+                    with self.assertRaisesRegex(RuntimeError, failure):
+                        actor._optimizer_step()
+                expected = ["load", "step", "offload"] if failure == "step_error" else ["load", "offload"]
+                self.assertEqual(events, expected)
+                verifier = TestOptimizationTrajectory()
+                verifier.assert_state_equal(actor.actor_module.state_dict(), original_parameters)
+                verifier.assert_state_equal(actor.actor_optimizer.state_dict(), original_state)
+
+    def test_paired_and_independent_shadow_updates_preserve_live_state_and_rng_with_offload(self):
+        for trajectory_enabled in (False, True):
+            with self.subTest(trajectory=trajectory_enabled):
+                directory = self.root / f"diagnostics_{trajectory_enabled}"
+                recorded = make_actor(True, directory, mode="paired")
+                recorded._is_offload_optimizer = True
+                recorded.gradient_record_config.update(
+                    single_step={"enabled": not trajectory_enabled},
+                    trajectory={"enabled": trajectory_enabled},
+                    baselines={"enabled": True, "seed": 23},
+                )
+                ordinary = make_actor(False, self.root / "ordinary")
+                supervised = make_actor(False, self.root / "supervised")
+                shuffled = make_actor(False, self.root / "shuffled")
+                for step, learning_rate in enumerate((0.01, 0.003, 0.008), start=1):
+                    batch = TestPairedRandomBaselines.baseline_batch(step)
+                    for actor in (recorded, ordinary, supervised, shuffled):
+                        actor.actor_optimizer.param_groups[0]["lr"] = learning_rate
+                    if trajectory_enabled:
+                        for reference, key in (
+                            (supervised, "diagnostic_supervised_advantages"),
+                            (shuffled, "diagnostic_shuffled_advantages"),
+                        ):
+                            reference_batch = Batch(
+                                {**batch.batch, "advantages": batch.batch[key]}, {"temperature": 1.0}
+                            )
+                            torch.manual_seed(200 + step)
+                            reference.update_policy(reference_batch)
+                    torch.manual_seed(200 + step)
+                    expected_metrics = ordinary.update_policy(sample_batch(step))
+                    expected_rng = torch.random.get_rng_state().clone()
+                    torch.manual_seed(200 + step)
+                    with self.tracked_residency(recorded) as events:
+                        actual_metrics = recorded.update_policy(batch)
+                    self.assertEqual(events.count("load"), 3 if trajectory_enabled else 1)
+                    self.assertEqual(events.count("step"), events.count("load"))
+                    self.assertEqual(events.count("offload"), events.count("load"))
+                    self.assert_training_equal(recorded, ordinary)
+                    self.assertEqual(actual_metrics, expected_metrics)
+                    self.assertTrue(torch.equal(torch.random.get_rng_state(), expected_rng))
+                    if trajectory_enabled:
+                        trajectory = recorded.optimization_trajectory
+                        for parameters, state, reference in (
+                            (trajectory.supervised_parameters, trajectory.supervised_optimizer_state, supervised),
+                            (trajectory.shuffled_parameters, trajectory.shuffled_optimizer_state, shuffled),
+                        ):
+                            for actual, expected in zip(parameters, reference.actor_module.parameters()):
+                                torch.testing.assert_close(actual, expected.detach(), rtol=0, atol=0)
+                            restored = diagnostics._restore_state(state)
+                            for actual, expected in zip(restored.values(), reference.actor_optimizer.state.values()):
+                                TestOptimizationTrajectory().assert_state_equal(actual, expected)
+                                self.assertTrue(all(
+                                    value.device.type == "cpu" for value in actual.values()
+                                    if isinstance(value, torch.Tensor)
+                                ))
 
 
 if __name__ == "__main__":

@@ -176,6 +176,95 @@ def smoke_config():
     )
 
 
+class TestActorOptimizerOffloadDispatch(unittest.TestCase):
+    @staticmethod
+    def worker_method(name):
+        path = ROOT / "verl/workers/fsdp_workers.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        worker = next(node for node in tree.body
+                      if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
+        method = next(node for node in worker.body if getattr(node, "name", None) == name)
+        method.decorator_list = []
+        return path, method
+
+    def test_actor_receives_effective_offload_policy(self):
+        path, method = self.worker_method("init_model")
+        assignment = next(node for node in ast.walk(method)
+                          if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                          and isinstance(node.value.func, ast.Name)
+                          and node.value.func.id == "DataParallelPPOActor")
+        for effective_offload in (False, True):
+            with self.subTest(effective_offload=effective_offload):
+                # FSDP2 CPUOffloadPolicy can override the raw True setting.
+                worker = SimpleNamespace(
+                    config=Config(actor=Config(fsdp_config=Config(optimizer_offload=True))),
+                    actor_module_fsdp=object(), actor_optimizer=object(),
+                    _is_offload_optimizer=effective_offload,
+                )
+                namespace = {"self": worker, "DataParallelPPOActor": lambda **kwargs: kwargs}
+                exec(compile(ast.Module(body=[assignment], type_ignores=[]), str(path), "exec"), namespace)
+                self.assertIs(worker.actor["optimizer_offload"], effective_offload)
+                self.assertIs(worker.actor["actor_optimizer"], worker.actor_optimizer)
+
+    def test_worker_keeps_optimizer_offloaded_until_actor_update(self):
+        path, method = self.worker_method("update_actor")
+        for optimizer_offload in (False, True):
+            with self.subTest(optimizer_offload=optimizer_offload):
+                events = []
+
+                class Data:
+                    def __init__(self, meta_info):
+                        self.meta_info = meta_info
+
+                    def to(self, device):
+                        return self
+
+                class Sharding:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        return False
+
+                    def preprocess_data(self, data):
+                        events.append("preprocess")
+                        return data
+
+                    def postprocess_data(self, data):
+                        events.append("postprocess")
+                        return data
+
+                def update_policy(data):
+                    events.append("actor_update")
+                    return {"actor/test": 1.0}
+
+                worker = SimpleNamespace(
+                    _is_actor=True, _is_offload_param=False, _is_offload_optimizer=optimizer_offload,
+                    actor_optimizer=object(), ulysses_sharding_manager=Sharding(),
+                    actor=SimpleNamespace(update_policy=update_policy),
+                    config=Config(actor=Config(ppo_epochs=2)), world_size=2,
+                    flops_counter=SimpleNamespace(estimate_flops=lambda *args: (4.0, 8.0)),
+                    actor_lr_scheduler=SimpleNamespace(
+                        get_last_lr=lambda: [0.001], step=lambda: events.append("scheduler")),
+                )
+                namespace = {
+                    "DataProto": Data, "logger": None,
+                    "Timer": lambda **kwargs: nullcontext(SimpleNamespace(last=1.0)),
+                    "get_torch_device": lambda: SimpleNamespace(
+                        max_memory_allocated=lambda: 0, max_memory_reserved=lambda: 0),
+                    "psutil": SimpleNamespace(virtual_memory=lambda: SimpleNamespace(used=0)),
+                    "load_fsdp_optimizer": Mock(side_effect=AssertionError("Premature optimizer loading")),
+                    "offload_fsdp_optimizer": lambda **kwargs: events.append("offload"),
+                    "log_gpu_memory_usage": lambda *args, **kwargs: None,
+                }
+                exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+                output = namespace["update_actor"](worker, Data({"global_token_num": 1}))
+                self.assertEqual(events, ["preprocess", "actor_update", "scheduler", "postprocess"]
+                                 + (["offload"] if optimizer_offload else []))
+                self.assertEqual(output.meta_info["metrics"]["actor/test"], 1.0)
+                namespace["load_fsdp_optimizer"].assert_not_called()
+
+
 class TestTrainerMultiTurnConfig(unittest.TestCase):
     def setUp(self):
         trainer_type, reward_module, weight_module = load_validation()

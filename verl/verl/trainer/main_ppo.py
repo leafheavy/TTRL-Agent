@@ -19,6 +19,7 @@ import os
 import socket
 
 import hydra
+import psutil
 import ray
 from omegaconf import OmegaConf
 
@@ -28,7 +29,40 @@ from verl.trainer.ppo.reward import load_reward_manager
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
-    run_ppo(config)
+    try:
+        run_ppo(config)
+    finally:
+        _shutdown_ray()
+
+
+def _shutdown_ray():
+    """Release this CLI's workers before the sequential launcher can continue."""
+    # Snapshot before Ray exits: workers may change process groups or become
+    # reparented during shutdown. Shared-cluster workers are not our children.
+    processes = psutil.Process().children(recursive=True)
+    try:
+        ray.shutdown()
+    finally:
+        for action, timeout in ((None, 10), ("terminate", 5), ("kill", 5)):
+            if not processes:
+                break
+            if action:
+                print(f"[shutdown] {action}: {len(processes)} remaining child processes", flush=True)
+                for process in processes:
+                    try:
+                        getattr(process, action)()
+                    except psutil.NoSuchProcess:
+                        pass
+            _, alive = psutil.wait_procs(processes, timeout=timeout)
+            processes = []
+            for process in alive:
+                try:
+                    if process.status() != psutil.STATUS_ZOMBIE:
+                        processes.append(process)
+                except psutil.NoSuchProcess:
+                    pass
+        if processes:
+            raise RuntimeError(f"Training child processes did not exit: {[process.pid for process in processes]}")
 
 
 # Define a function to run the PPO-like training process
