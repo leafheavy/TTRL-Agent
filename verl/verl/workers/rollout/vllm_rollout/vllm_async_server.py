@@ -40,6 +40,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
 from vllm.worker.worker_base import WorkerWrapperBase
 
+from verl.utils.bfcl_eval import get_vllm_eval_settings, get_vllm_runtime_metadata
 from verl.utils.fs import copy_to_local
 from verl.workers.rollout.async_server import AsyncServerBase
 
@@ -220,26 +221,10 @@ class AsyncvLLMServer(AsyncServerBase):
         model_path = config.model.path
         model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(model_path)
-        trust_remote_code = config.model.get("trust_remote_code", False)
+        engine_settings = get_vllm_eval_settings({"actor_rollout_ref": config}, SamplingParams)
+        self.max_model_len = engine_settings["max_model_len"]
+        print(f"override_generation_config: {engine_settings['override_generation_config']}")
         config = config.rollout
-
-        tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
-        max_num_batched_tokens = config.get("max_num_batched_tokens", 8192)
-        max_model_len = config.max_model_len if config.max_model_len else config.prompt_length + config.response_length
-        self.max_model_len = int(max_model_len)
-
-        # Override default generation config from hugging face model config,
-        # user can still override them by passing kwargs in each request.
-        kwargs = dict(
-            n=1,
-            logprobs=0,
-            repetition_penalty=1.0,
-            max_new_tokens=config.response_length,
-        )
-        for k in config.keys():
-            if hasattr(SamplingParams(), str(k)):
-                kwargs[k] = config.get(k)
-        print(f"override_generation_config: {kwargs}")
 
         backend = os.environ.get("VERL_VLLM_DISTRIBUTED_BACKEND", "zeromq")
         if backend == "zeromq":
@@ -251,28 +236,23 @@ class AsyncvLLMServer(AsyncServerBase):
 
         engine_args = AsyncEngineArgs(
             model=local_path,
-            enable_sleep_mode=config.free_cache_engine,
-            override_generation_config=kwargs,
-            tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend=distributed_executor_backend,
-            dtype=config.dtype,
-            enforce_eager=config.enforce_eager,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            disable_custom_all_reduce=True,
-            skip_tokenizer_init=False,
-            max_model_len=self.max_model_len,
-            load_format="auto",
-            disable_log_stats=config.disable_log_stats,
-            max_num_batched_tokens=max_num_batched_tokens,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
-            trust_remote_code=trust_remote_code,
-            seed=config.get("seed", 0),
+            **engine_settings,
         )
 
         # init async llm engine
         vllm_config = self._create_engine_config(engine_args)
         self.engine = AsyncLLM.from_vllm_config(vllm_config)
+        if self.post_train_eval.get("enabled", False) and self.post_train_eval.get("output_dir"):
+            import json
+            from pathlib import Path
+
+            output = Path(self.post_train_eval["output_dir"])
+            output.mkdir(parents=True, exist_ok=True)
+            (output / f"vllm_eval_config_{self.vllm_dp_rank}.json").write_text(
+                json.dumps({"model_path": model_path, "engine_settings": engine_settings,
+                            "versions": get_vllm_runtime_metadata()}, indent=2), encoding="utf-8",
+            )
 
         # build serving chat
         model_config = self.engine.model_config

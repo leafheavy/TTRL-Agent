@@ -46,7 +46,8 @@ def load_validation():
         if getattr(node, "name", None) in (
             "_validate_config", "_validate_ttrl_config", "_validate_post_train_eval_config", "serve_after_training",
             "_training_drop_last", "_create_dataloader",
-            "_validate_epoch_failure_schedule", "_finish_failure_epoch", "_training_epoch_iterator",
+            "_validate_epoch_failure_schedule", "_training_epoch_count", "_finish_failure_epoch",
+            "_training_epoch_iterator",
             "_save_checkpoint", "_load_checkpoint",
         )
     ]
@@ -118,6 +119,8 @@ def load_vllm_serving():
         copy_to_local=lambda path: path, BaseModelPath=SimpleNamespace, OpenAIServingModels=Mock(),
         OpenAIServingChat=Mock(), OpenAIServingCompletion=Mock(), RequestLogger=Mock(),
         ExternalZeroMQDistributedExecutor=object(), ExternalRayDistributedExecutor=object(),
+        get_vllm_eval_settings=load_module("bfcl_eval", "verl/utils/bfcl_eval.py").get_vllm_eval_settings,
+        get_vllm_runtime_metadata=lambda: {"vllm": "test-vllm", "torch": "test-torch"},
         JSONResponse=lambda content, status_code=200: SimpleNamespace(content=content, status_code=status_code),
         StreamingResponse=lambda content, media_type: SimpleNamespace(content=content, media_type=media_type),
     )
@@ -362,22 +365,29 @@ class TestTrainerMultiTurnConfig(unittest.TestCase):
         self.config.actor_rollout_ref.rollout.multi_turn.tool_config_path = "native_tools.yaml"
         self.trainer._validate_config()
 
-    def test_epoch_frequency_requires_enabled_weighting_and_multiple_epochs(self):
+    def test_epoch_frequency_requires_enabled_weighting_and_a_valid_budget(self):
         self.config.failure_mode_detection = Config(enabled=True, advantage_weight=Config(
             enabled=False, epoch_frequency=Config(enabled=True),
         ))
         with self.assertRaisesRegex(ValueError, "epoch_frequency requires"):
             self.trainer._validate_config()
         self.config.failure_mode_detection.advantage_weight.enabled = True
-        for epochs in (1, 0, True, "2"):
+        for epochs in (0, -1, True, "2"):
             with self.subTest(epochs=epochs):
                 self.config.trainer.total_epochs = epochs
-                with self.assertRaisesRegex(ValueError, "total_epochs >= 2"):
+                with self.assertRaisesRegex(ValueError, "positive trainer.total_epochs"):
                     self.trainer._validate_config()
-        self.config.trainer.total_epochs = 2
+        self.config.trainer.total_epochs = 1
         self.trainer._validate_config()
+        self.config.trainer.total_training_steps = 100
+        self.trainer._validate_config()
+        for steps in (0, -1, True, "100"):
+            with self.subTest(steps=steps):
+                self.config.trainer.total_training_steps = steps
+                with self.assertRaisesRegex(ValueError, "total_training_steps must be a positive integer"):
+                    self.trainer._validate_config()
 
-    def test_epoch_frequency_rejects_dropped_cases_and_incomplete_training(self):
+    def test_epoch_frequency_accepts_partial_final_epochs_but_rejects_dropped_cases(self):
         self.config.failure_mode_detection = Config(enabled=True, advantage_weight=Config(
             enabled=True, epoch_frequency=Config(enabled=True),
         ))
@@ -391,13 +401,13 @@ class TestTrainerMultiTurnConfig(unittest.TestCase):
                 return 4
 
         self.trainer.train_dataloader = Loader()
-        for steps in (None, 8, 12):
+        for steps in (None, 1, 4, 5, 8, 9, 12, 16, 100):
             self.config.trainer.total_training_steps = steps
             self.trainer._validate_epoch_failure_schedule()
-        for steps in (4, 5, 9, 16, True, "8"):
+        for steps in (0, -1, True, "8"):
             with self.subTest(steps=steps):
                 self.config.trainer.total_training_steps = steps
-                with self.assertRaisesRegex(ValueError, "two complete available epochs"):
+                with self.assertRaisesRegex(ValueError, "total_training_steps must be a positive integer"):
                     self.trainer._validate_epoch_failure_schedule()
         self.config.trainer.total_training_steps = None
         self.trainer.train_dataset.append(8)
@@ -549,6 +559,21 @@ class TestBFCLTailBatches(unittest.TestCase):
         self.assertEqual(self.trainer.total_training_steps, 130)
         self.assertEqual(self.config.actor_rollout_ref.actor.optim.total_training_steps, 130)
 
+    def test_seal_100_cases_keep_four_case_tail_and_respect_epoch_or_step_budget(self):
+        self.config.data.train_batch_size = 32
+        self.config.actor_rollout_ref.actor.ppo_mini_batch_size = 32
+        self.config.actor_rollout_ref.rollout.n = 8
+        self.config.trainer.update(total_epochs=2, total_training_steps=None)
+        batches = list(self.create_loader(100))
+        self.assertEqual([len(batch) for batch in batches], [32, 32, 32, 4])
+        self.assertEqual([case for batch in batches for case in batch], list(range(100)))
+        self.assertEqual(self.trainer.total_training_steps, 8)
+        self.assertEqual(self.trainer._training_epoch_count(), 2)
+        self.config.trainer.total_training_steps = 100
+        self.create_loader(100)
+        self.assertEqual(self.trainer.total_training_steps, 100)
+        self.assertEqual(self.trainer._training_epoch_count(), 25)
+
     def test_smaller_than_one_configured_batch_is_retained(self):
         self.assertEqual(list(self.create_loader(8)), [list(range(8))])
         self.assertEqual(self.trainer.total_training_steps, 10)
@@ -574,15 +599,32 @@ class TestBFCLTailBatches(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "1 cases.*3 rollouts.*4 workers"):
             self.create_loader(193)
 
-    def test_dynamic_epoch_budget_uses_13_batches_including_tail(self):
+    def test_dynamic_epoch_budget_allows_partial_final_epochs_including_tail(self):
         self.config.failure_mode_detection = Config(advantage_weight=Config(epoch_frequency=Config(enabled=True)))
-        for steps in (None, 26, 130):
+        for steps in (None, 1, 13, 25, 26, 27, 100, 130, 131):
             self.config.trainer.total_training_steps = steps
             self.create_loader()
-        for steps in (13, 25, 27, 131):
+        for steps in (0, -1, True, "100"):
             self.config.trainer.total_training_steps = steps
-            with self.assertRaisesRegex(ValueError, "two complete available epochs"):
+            with self.assertRaisesRegex(ValueError, "total_training_steps must be a positive integer"):
                 self.create_loader()
+
+    def test_explicit_100_steps_override_epochs_with_a_32_case_batch(self):
+        self.config.data.train_batch_size = 32
+        self.config.actor_rollout_ref.rollout.n = 8
+        self.config.failure_mode_detection = Config(advantage_weight=Config(epoch_frequency=Config(enabled=True)))
+        for epochs in (1, 16, 20):
+            with self.subTest(epochs=epochs):
+                self.config.trainer.update(total_epochs=epochs, total_training_steps=100)
+                loader = self.create_loader()
+                self.assertEqual([len(batch) for batch in loader], [32] * 6 + [8])
+                self.assertEqual(self.trainer.total_training_steps, 100)
+                self.assertEqual(self.config.actor_rollout_ref.actor.optim.total_training_steps, 100)
+                self.assertEqual(self.trainer._training_epoch_count(), 15)
+        self.config.trainer.total_training_steps = None
+        self.create_loader()
+        self.assertEqual(self.trainer.total_training_steps, 140)
+        self.assertEqual(self.trainer._training_epoch_count(), 20)
 
     def test_failure_rate_counts_rollouts_instead_of_averaging_batch_rates(self):
         path = ROOT / "verl/trainer/ppo/ttrl_utils.py"
@@ -655,6 +697,58 @@ class TestEpochFailureLifecycle(unittest.TestCase):
         self.trainer.epoch_failure_weights.finish_epoch.assert_called_once_with()
         self.assertEqual(self.trainer._failure_epoch_batches, 0)
         self.assertEqual(list(iterator), [])
+
+    def test_step_budget_does_not_commit_an_incomplete_final_epoch(self):
+        _, _, weight_module = load_validation()
+
+        class Rollouts:
+            def __init__(self, size, failed):
+                self.size = size
+                events = [{"type": "format_failure", "turn": 0, "recovery": "unrecovered"}] if failed else []
+                self.non_tensor_batch = {
+                    "failure_modes": [deepcopy(events) for _ in range(size)],
+                    "failure_mode_detection_enabled": [True] * size,
+                    "failure_mode_num_turns": [1] * size,
+                }
+
+            def __len__(self):
+                return self.size
+
+        self.trainer.train_dataset = list(range(200))
+        self.trainer.train_dataloader = [list(range(start, min(start + 32, 200))) for start in range(0, 200, 32)]
+        self.trainer.config.actor_rollout_ref.rollout.n = 8
+        for budget in (1, 7, 100):
+            with self.subTest(budget=budget):
+                controller = weight_module.EpochFailureWeights({"enabled": True, "epoch_frequency": {"enabled": True}})
+                self.trainer.epoch_failure_weights = controller
+                self.trainer._failure_epoch_batches = 0
+                self.trainer.total_training_steps = budget
+                completed_steps = budget // 7 * 7
+                updates = case_visits = 0
+                for epoch in range(self.trainer._training_epoch_count()):
+                    iterator = iter(self.trainer.train_dataloader)
+                    for cases in iterator:
+                        controller.observe(Rollouts(len(cases) * 8, updates >= completed_steps))
+                        self.trainer._finish_failure_epoch(iterator)
+                        updates += 1
+                        case_visits += len(cases)
+                        if updates == budget:
+                            break
+                    if updates == budget:
+                        break
+                self.assertEqual(updates, budget)
+                self.assertEqual(controller.completed_epochs, budget // 7)
+                self.assertEqual(self.trainer._failure_epoch_batches, budget % 7)
+                self.assertEqual(controller.total_rollouts, budget % 7 * 32 * 8)
+                self.assertEqual(controller.counts["format_failure"], controller.total_rollouts)
+                # Only complete epochs (all failure-free here) may change weights.
+                expected_weight = 1.0 if budget >= 7 else controller.initial_weights["format_failure"]
+                self.assertEqual(controller.current_weights["format_failure"], expected_weight)
+                restored = weight_module.EpochFailureWeights({"enabled": True, "epoch_frequency": {"enabled": True}})
+                restored.load_state_dict(controller.state_dict())
+                self.assertEqual(restored.state_dict(), controller.state_dict())
+                if budget == 100:
+                    self.assertEqual(case_visits, 2864)
 
     def test_resume_boundary_retries_one_empty_iterator_without_losing_first_batch(self):
         loader = Mock()
@@ -758,6 +852,9 @@ class TestEpochFailureLifecycle(unittest.TestCase):
         self.assertLess(observes[0].lineno, by_name["update_actor"])
         self.assertLess(by_name["_finish_failure_epoch"], by_name["_save_checkpoint"])
         self.assertLess(by_name["_finish_failure_epoch"], by_name["log"])
+        epoch_loop = next(node for node in ast.walk(fit) if isinstance(node, ast.For)
+                          and isinstance(node.target, ast.Name) and node.target.id == "epoch")
+        self.assertEqual(epoch_loop.iter.args[1].func.attr, "_training_epoch_count")
 
     def test_tail_checkpoint_restores_real_loader_prefix_and_epoch_boundary(self):
         import torch
@@ -811,6 +908,33 @@ class TestEpochFailureLifecycle(unittest.TestCase):
 
 
 class TestInMemoryOpenAIServing(unittest.TestCase):
+    def test_actual_engine_settings_are_recorded_for_the_no_update_control(self):
+        server_type, namespace = load_vllm_serving()
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                actor_rollout_ref=Config(
+                    model=Config(path="/models/original"),
+                    rollout=Config(
+                        max_model_len=32768, response_length=4096, free_cache_engine=True,
+                        tensor_model_parallel_size=2, max_num_batched_tokens=12288,
+                        dtype="bfloat16", enforce_eager=False, gpu_memory_utilization=0.4,
+                        disable_log_stats=True, enable_chunked_prefill=True,
+                        multi_turn=Config(tool_config_path=None, format="hermes"),
+                    ),
+                ),
+                trainer=Config(post_train_eval=Config(enabled=True, output_dir=directory)),
+            )
+            server = server_type(config, 1, 0, "test")
+            server._create_engine_config = Mock()
+            asyncio.run(server.init_engine())
+            recorded = json.loads((Path(directory) / "vllm_eval_config_0.json").read_text())
+            kwargs = namespace["AsyncEngineArgs"].call_args.kwargs.copy()
+            kwargs.pop("model")
+            kwargs.pop("distributed_executor_backend")
+            self.assertEqual(recorded["engine_settings"], kwargs)
+            self.assertEqual(recorded["model_path"], "/models/original")
+            self.assertEqual(recorded["versions"], namespace["get_vllm_runtime_metadata"]())
+
     def test_aliases_and_handlers_share_the_existing_engine(self):
         model_path = "/root/models/Qwen/Qwen2.5-3B-Instruct"
         model_name = "Qwen/Qwen2.5-3B-Instruct"
@@ -1179,6 +1303,9 @@ class TestIndependentMultiTurnLauncher(unittest.TestCase):
                 if os.environ.get("FAKE_OCCUPIED"):
                     sys.argv = args
                     runpy.run_path(args[0], run_name="__main__")
+            elif args[0].endswith("utils/bfcl_eval.py"):
+                path(value("--record-bfcl-env")).write_text("{}")
+                event("eval_environment", category=category)
             elif args[0] == "data/preprocess.py":
                 if "--bfcl-categories" in args:
                     category = value("--bfcl-categories")
@@ -1186,8 +1313,10 @@ class TestIndependentMultiTurnLauncher(unittest.TestCase):
                     output.mkdir(parents=True, exist_ok=True)
                     (output / "train.parquet").touch()
                     (output / "test.parquet").touch()
-                    (output / "case_ids.json").write_text(json.dumps({category: [category + "_0"]}))
-                    event("preprocess", category=category)
+                    evaluation = value("--bfcl-eval-split")
+                    selected = category + ("_1" if evaluation == "heldout" else "_0")
+                    (output / "case_ids.json").write_text(json.dumps({category: [selected]}))
+                    event("preprocess", category=category, split=value("--bfcl-split"), evaluation=evaluation)
                 elif "--bfcl-check-results" in args:
                     assert (project / "result" / "generated.json").is_file()
                     event("check_results", category=category)
@@ -1248,7 +1377,8 @@ class TestIndependentMultiTurnLauncher(unittest.TestCase):
                 server.server_close()
                 event("train_stopped", category=category)
             elif args[:3] == ["-m", "bfcl_eval", "generate"]:
-                event("generate", category=category, arguments=args)
+                cases = json.loads((project / "test_case_ids_to_generate.json").read_text())
+                event("generate", category=category, arguments=args, cases=cases)
                 if category == os.environ.get("FAKE_FAIL_GENERATE"):
                     (project.parent / "abort_train").touch()
                     sys.exit(9)
@@ -1319,10 +1449,41 @@ class TestIndependentMultiTurnLauncher(unittest.TestCase):
                 self.assertLess(stopped, started)
         self.assertEqual(events[-1]["kind"], "summary")
         self.assertTrue((self.suite / "multi_turn_summary.json").is_file())
+        for event in events:
+            if event["kind"] == "preprocess":
+                self.assertEqual((event["split"], event["evaluation"]), ("seal", "train"))
+        configuration = (self.suite / self.categories[0] / "run.env").read_text(encoding="utf-8")
+        self.assertIn("export BFCL_SPLIT=seal", configuration)
+        self.assertIn("export BFCL_EVAL_SPLIT=train", configuration)
         result, repeated = self.launch()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("fresh RUN_ROOT", result.stdout)
         self.assertEqual(events, repeated)
+
+    def test_heldout_selection_reaches_official_generation_for_every_category(self):
+        result, events = self.launch(BFCL_SPLIT="seal", BFCL_EVAL_SPLIT="heldout")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        generated = [event for event in events if event["kind"] == "generate"]
+        self.assertEqual(len(generated), len(self.categories))
+        for event in generated:
+            category = event["category"]
+            self.assertEqual(event["cases"], {category: [category + "_1"]})
+            configuration = (self.suite / category / "run.env").read_text(encoding="utf-8")
+            self.assertIn("export BFCL_EVAL_SPLIT=heldout", configuration)
+        for event in events:
+            if event["kind"] == "preprocess":
+                self.assertEqual((event["split"], event["evaluation"]), ("seal", "heldout"))
+
+    def test_legacy_all_partition_is_explicit_and_invalid_combinations_stop_before_training(self):
+        result, events = self.launch(BFCL_SPLIT="all", BFCL_EVAL_SPLIT="heldout")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("BFCL_SPLIT=seal", result.stdout)
+        self.assertEqual(events, [])
+        result, events = self.launch(BFCL_SPLIT="all", BFCL_EVAL_SPLIT="train", FAKE_FAIL_TRAIN=self.categories[0])
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        selected = [event for event in events if event["kind"] == "preprocess"]
+        self.assertEqual(len(selected), 1)
+        self.assertEqual((selected[0]["split"], selected[0]["evaluation"]), ("all", "train"))
 
     def test_training_failure_stops_before_starting_the_next_category(self):
         result, events = self.launch(FAKE_FAIL_TRAIN=self.categories[0])

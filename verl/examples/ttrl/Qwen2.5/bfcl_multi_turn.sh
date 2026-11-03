@@ -12,6 +12,13 @@ TRAIN_PYTHON=${TRAIN_PYTHON:-$(command -v python)}
 export TRAIN_PYTHON
 BFCL_MODEL=${BFCL_MODEL:-Qwen/$(basename "$MODEL_PATH")-FC}
 CONSENSUS=${CONSENSUS:-observations}
+BFCL_SPLIT=${BFCL_SPLIT:-seal}
+BFCL_EVAL_SPLIT=${BFCL_EVAL_SPLIT:-train}
+export BFCL_SPLIT BFCL_EVAL_SPLIT
+case "$BFCL_SPLIT:$BFCL_EVAL_SPLIT" in
+  seal:train|seal:heldout|all:train) ;;
+  *) echo 'Use BFCL_SPLIT=seal with BFCL_EVAL_SPLIT=train/heldout, or all:train for legacy runs.' >&2; exit 1 ;;
+esac
 ENDPOINT=${BENCHMARK_RUNTIME_ENDPOINT:-http://127.0.0.1:1054}
 POST_EVAL=False
 TTRL_ENABLED=True
@@ -87,6 +94,7 @@ for category in "${CATEGORIES[@]}"; do
   export BFCL_PROJECT_ROOT="$child_root/eval"
   echo "[multi_turn] $category: original model=$MODEL_PATH; output=$child_root"
   data_args=(--bfcl-categories "$category" --bfcl-consensus "$CONSENSUS"
+    --bfcl-split "$BFCL_SPLIT" --bfcl-eval-split "$BFCL_EVAL_SPLIT"
     --bfcl-max-samples "${MAX_TRAIN_SAMPLES:-0}" --output-dir "$child_root/data")
   if [ "${FS_ONLY:-False}" = True ]; then data_args+=(--bfcl-fs-only); fi
   "$BFCL_PYTHON" data/preprocess.py "${data_args[@]}" > "$child_root/preprocess.log" 2>&1
@@ -125,6 +133,7 @@ for category in "${CATEGORIES[@]}"; do
     if [ -f "$SUITE_ROOT/run.env" ]; then cat "$SUITE_ROOT/run.env"; fi
     printf 'export RUN_ROOT=%q\nexport TRAIN_CATEGORIES=%q\nexport EVAL_CATEGORIES=%q\n' "$child_root" "$category" "$category"
     printf 'export MODEL_PATH=%q\nexport BFCL_MODEL=%q\n' "$MODEL_PATH" "$BFCL_MODEL"
+    printf 'export BFCL_SPLIT=%q\nexport BFCL_EVAL_SPLIT=%q\n' "$BFCL_SPLIT" "$BFCL_EVAL_SPLIT"
     BFCL_TRAIN_ARGS=("${args[@]}")
     declare -p BFCL_TRAIN_ARGS
   } > "$child_root/run.env"
@@ -169,9 +178,13 @@ if not result.get("choices"):
     json.dumps({"model": model, "served_models": names, "ok": True}, indent=2), encoding="utf-8")
 PY
   cp "$child_root/data/case_ids.json" "$BFCL_PROJECT_ROOT/test_case_ids_to_generate.json"
+  "$BFCL_PYTHON" verl/utils/bfcl_eval.py --record-bfcl-env "$child_root/eval/bfcl_environment.json" \
+    --bfcl-model "$BFCL_MODEL" --temperature "${BFCL_EVAL_TEMPERATURE:-0.001}" \
+    --num-threads "${BFCL_NUM_THREADS:-1}"
   "$BFCL_PYTHON" -m bfcl_eval generate --model "$BFCL_MODEL" \
     --local-model-path "$REMOTE_OPENAI_TOKENIZER_PATH" --run-ids \
-    --backend vllm --skip-server-setup --num-threads "${BFCL_NUM_THREADS:-1}" \
+    --backend vllm --skip-server-setup --temperature "${BFCL_EVAL_TEMPERATURE:-0.001}" \
+    --num-threads "${BFCL_NUM_THREADS:-1}" \
     2>&1 | tee "$child_root/eval/generate.log"
   if grep -Eq '(Error code: 404|openai[.]NotFoundError).*The model .*does not exist' "$child_root/eval/generate.log"; then
     echo 'Model-service 404; aborting before scoring.' >&2

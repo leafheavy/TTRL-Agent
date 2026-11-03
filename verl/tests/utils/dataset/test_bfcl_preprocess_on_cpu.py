@@ -1,7 +1,10 @@
 """Check exact case reuse, label isolation, and completeness before BFCL scoring."""
 
 import csv
+import hashlib
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +16,9 @@ from bfcl_eval import utils as bfcl_utils
 from data.preprocess import (
     MULTI_TURN_COLUMNS,
     check_bfcl_result_ids,
+    load_bfcl_seal_split,
     prepare_bfcl_data,
+    prepare_bfcl_seal_data,
     select_bfcl_inputs,
     summarize_bfcl_multi_turn,
 )
@@ -160,6 +165,128 @@ class TestBFCLResultIDs(unittest.TestCase):
                 check_bfcl_result_ids({}, tmp)
 
 
+class TestBFCLSEALSplit(unittest.TestCase):
+    def setUp(self):
+        self.source = {
+            category: [entry(category, index) for index in range(200)]
+            for category, _ in MULTI_TURN_COLUMNS
+        }
+        self.files = patch.object(bfcl_utils, "find_file_by_category", side_effect=lambda category, _: category)
+        self.loads = patch.object(bfcl_utils, "load_file", side_effect=lambda category, **_: self.source[category])
+
+    select = TestBFCLPreprocess.select
+
+    def test_bundled_manifest_matches_exact_scenarios_in_all_four_categories(self):
+        manifest = load_bfcl_seal_split()
+        train = self.select(split="seal")
+        heldout = self.select(split="seal", partition="heldout")
+        self.assertEqual({row["id"] for row in train}, set(manifest["train"]))
+        self.assertEqual({row["id"] for row in heldout}, set(manifest["test"]))
+        train_scenarios = {row["id"].rsplit("_", 1)[-1] for row in train}
+        heldout_scenarios = {row["id"].rsplit("_", 1)[-1] for row in heldout}
+        self.assertEqual(len(train_scenarios), 100)
+        self.assertEqual(len(heldout_scenarios), 100)
+        self.assertFalse(train_scenarios & heldout_scenarios)
+        for category, _ in MULTI_TURN_COLUMNS:
+            self.assertEqual(sum(row["id"].startswith(category + "_") for row in train), 100)
+            self.assertEqual(sum(row["id"].startswith(category + "_") for row in heldout), 100)
+        self.assertNotEqual([row["id"] for row in train[:100]], [
+            f"multi_turn_base_{index}" for index in range(100)
+        ])
+        self.assertTrue(all("ground_truth" not in row and "possible_answer" not in row for row in train + heldout))
+
+    def test_manifest_rejects_wrong_seed_duplicate_ids_and_cross_partition_scenarios(self):
+        for fault in ("seed", "duplicate", "overlap", "unknown"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                manifest = load_bfcl_seal_split()
+                if fault == "seed":
+                    manifest["seed"] = 43
+                elif fault == "duplicate":
+                    manifest["train"][0] = manifest["train"][1]
+                elif fault == "overlap":
+                    manifest["test"][0] = manifest["train"][0]
+                else:
+                    manifest["train"][0] = "multi_turn_base_999"
+                path = Path(tmp) / "split.json"
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    load_bfcl_seal_split(path)
+
+    def test_installed_inputs_must_cover_both_partitions_without_unknown_or_duplicate_ids(self):
+        category = "multi_turn_base"
+        original = self.source[category][:]
+        for fault in ("missing", "duplicate", "unknown", "invalid"):
+            with self.subTest(fault=fault):
+                self.source[category] = original[:]
+                if fault == "missing":
+                    self.source[category].pop()
+                elif fault == "duplicate":
+                    self.source[category].append(original[0])
+                elif fault == "unknown":
+                    self.source[category].append(entry(category, 200))
+                else:
+                    self.source[category].append({"id": None})
+                with self.assertRaises(ValueError):
+                    self.select(category, split="seal", max_samples=1)
+
+    def test_partitions_are_chosen_before_domain_filtering_and_training_cap(self):
+        category = "multi_turn_base"
+        for index, row in enumerate(self.source[category]):
+            if index % 2:
+                row["involved_classes"] = ["MathAPI"]
+        train = self.select(category, split="seal", fs_only=True, max_samples=2)
+        heldout = self.select(category, split="seal", partition="heldout", consensus="state")
+        manifest = load_bfcl_seal_split()
+        self.assertEqual(len(train), 2)
+        self.assertTrue({row["id"] for row in train} <= set(manifest["train"]))
+        expected = {case_id for case_id in manifest["test"]
+                    if case_id.startswith(category + "_") and int(case_id.rsplit("_", 1)[-1]) % 2 == 0}
+        self.assertEqual({row["id"] for row in heldout}, expected)
+        self.assertTrue(all(row["observable_state"] == {"GorillaFileSystem": ["root"]} for row in heldout))
+
+    def test_export_preserves_training_ids_and_full_reserved_pool_for_either_eval_side(self):
+        category = "multi_turn_base"
+        source_path = Path(__file__).resolve().parents[3] / "data" / "bfcl_400_split.json"
+        for eval_split in ("train", "heldout"):
+            with self.subTest(eval_split=eval_split), tempfile.TemporaryDirectory() as tmp, self.files, self.loads:
+                selected, cases = prepare_bfcl_seal_data(category, tmp, max_samples=3, eval_split=eval_split)
+                root = Path(tmp)
+                metadata = json.loads((root / "split_manifest.json").read_text(encoding="utf-8"))
+                train_ids = [row["id"] for row in selected]
+                reserved = metadata["heldout_case_ids"][category]
+                self.assertEqual(len(train_ids), 3)
+                self.assertEqual(len(reserved), 100)
+                self.assertFalse(set(train_ids) & set(reserved))
+                expected = train_ids if eval_split == "train" else reserved
+                self.assertEqual(cases, {category: expected})
+                self.assertEqual(metadata["eval_case_ids"], cases)
+                self.assertEqual(metadata["eval_split"], eval_split)
+                self.assertEqual(metadata["source"]["sha256"], hashlib.sha256(source_path.read_bytes()).hexdigest())
+                for filename, ids in (("train_case_ids.json", train_ids), ("heldout_case_ids.json", reserved)):
+                    self.assertEqual(json.loads((root / filename).read_text(encoding="utf-8")), {category: ids})
+                for split, ids in (("train", train_ids), ("test", expected)):
+                    rows = datasets.Dataset.from_parquet(str(root / f"{split}.parquet")).to_list()
+                    self.assertEqual([row["extra_info"]["index"] for row in rows], ids)
+                    self.assertTrue(all("reward_model" not in row for row in rows))
+                inputs = (root / "task_inputs.json").read_text(encoding="utf-8")
+                self.assertNotIn("ground_truth", inputs)
+                self.assertNotIn("possible_answer", inputs)
+
+    def test_incompatible_cli_options_fail_before_reading_data(self):
+        script = Path(__file__).resolve().parents[3] / "data" / "preprocess.py"
+        combinations = (
+            ["--bfcl-split", "seal"],
+            ["--bfcl-split", "seal", "--bfcl-train-json", "not-read.json"],
+            ["--bfcl-split", "seal", "--bfcl-categories", "multi_turn", "--bfcl-val-json", "not-read.json"],
+            ["--bfcl-eval-split", "heldout", "--bfcl-categories", "multi_turn"],
+        )
+        for arguments in combinations:
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, str(script), *arguments], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("error:", result.stderr)
+
+
 class TestBFCLMultiTurnSummary(unittest.TestCase):
     model = "Qwen/Qwen2.5-3B-Instruct-FC"
 
@@ -192,6 +319,56 @@ class TestBFCLMultiTurnSummary(unittest.TestCase):
 
     def assert_no_summary(self, root):
         self.assertEqual(list(root.glob("multi_turn_summary.*")), [])
+
+    def add_protocols(self, root, runs, eval_split="heldout"):
+        for category, run in runs.items():
+            cases = {category: run["ids"]}
+            metadata = {
+                "split": "seal", "eval_split": eval_split,
+                "setting": "heldout_generalization" if eval_split == "heldout" else "same_case_adaptation",
+                "source": {"name": "SEAL", "sha256": "shared-source-hash"},
+                "selection": {"categories": [category], "consensus": "observations",
+                              "fs_only": False, "max_samples": 0},
+                "eval_case_ids": cases,
+            }
+            path = root / category / "data" / "split_manifest.json"
+            path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    def test_summary_records_heldout_protocol_and_correct_description(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = self.create_runs(root)
+            self.add_protocols(root, runs)
+            summary = summarize_bfcl_multi_turn(root, self.model, "Heldout")
+            self.assertEqual(summary["data_protocol"]["eval_split"], "heldout")
+            self.assertEqual(summary["data_protocol"]["setting"], "heldout_generalization")
+            markdown = (root / "multi_turn_summary.md").read_text(encoding="utf-8")
+            self.assertIn("场景隔离的留出 case", markdown)
+            self.assertNotIn("同批 case", markdown)
+
+    def test_mixed_or_inconsistent_split_protocols_produce_no_summary(self):
+        for fault in ("missing", "eval_split", "source", "selection", "case_ids"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runs = self.create_runs(root)
+                self.add_protocols(root, runs)
+                path = root / "multi_turn_long_context" / "data" / "split_manifest.json"
+                if fault == "missing":
+                    path.unlink()
+                else:
+                    metadata = json.loads(path.read_text(encoding="utf-8"))
+                    if fault == "eval_split":
+                        metadata.update(eval_split="train", setting="same_case_adaptation")
+                    elif fault == "source":
+                        metadata["source"]["sha256"] = "different-source-hash"
+                    elif fault == "selection":
+                        metadata["selection"]["consensus"] = "calls"
+                    else:
+                        metadata["eval_case_ids"] = {}
+                    path.write_text(json.dumps(metadata), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    summarize_bfcl_multi_turn(root, self.model, "Mixed")
+                self.assert_no_summary(root)
 
     def test_macro_average_and_table_order_preserve_unrounded_json(self):
         label = "Full | calls\nfrequency"

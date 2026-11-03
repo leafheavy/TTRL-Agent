@@ -640,10 +640,9 @@ class RayPPOTrainer:
             f"{len(self.val_dataloader)}"
         )
 
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
+        total_training_steps = self.config.trainer.total_training_steps
+        if total_training_steps is None:
+            total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
         self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
@@ -659,7 +658,7 @@ class RayPPOTrainer:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _validate_epoch_failure_schedule(self):
-        """Require complete BFCL case coverage and full epochs for dynamic weights."""
+        """Cover every BFCL case per epoch; a step budget may stop the final epoch early."""
         dynamic = self.config.get("failure_mode_detection", {}).get("advantage_weight", {}).get(
             "epoch_frequency", {}
         )
@@ -704,16 +703,18 @@ class RayPPOTrainer:
         if not dynamic.get("enabled", False):
             return
         steps = self.config.trainer.get("total_training_steps")
-        batches = len(self.train_dataloader)
         if steps is not None and (
-            isinstance(steps, bool) or not isinstance(steps, int)
-            or steps < 2 * batches or steps % batches
-            or steps > batches * self.config.trainer.total_epochs
+            isinstance(steps, bool) or not isinstance(steps, int) or steps < 1
         ):
-            raise ValueError("epoch_frequency total_training_steps must span at least two complete available epochs")
+            raise ValueError("trainer.total_training_steps must be a positive integer or null")
+
+    def _training_epoch_count(self):
+        """Run enough epochs to reach the resolved step budget, including a partial final epoch."""
+        batches = len(self.train_dataloader)
+        return (self.total_training_steps + batches - 1) // batches
 
     def _finish_failure_epoch(self, epoch_iterator):
-        """Finalize before checkpointing, including the final training step."""
+        """Commit complete epochs before checkpoints; retain unfinished-epoch counts."""
         if not self.epoch_failure_weights.enabled:
             return {}
         self._failure_epoch_batches += 1
@@ -1310,9 +1311,13 @@ class RayPPOTrainer:
 
             validate_failure_weight_config(failure_weight)
             if dynamic_enabled:
-                epochs = self.config.trainer.get("total_epochs", 1)
-                if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 2:
-                    raise ValueError("epoch_frequency requires trainer.total_epochs >= 2 to use updated weights")
+                steps = self.config.trainer.get("total_training_steps")
+                if steps is None:
+                    epochs = self.config.trainer.get("total_epochs", 1)
+                    if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+                        raise ValueError("epoch_frequency requires a positive trainer.total_epochs when steps are null")
+                elif isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+                    raise ValueError("trainer.total_training_steps must be a positive integer or null")
             rollout = self.config.actor_rollout_ref.rollout
             if not failure_detection.get("enabled", False):
                 raise ValueError("Failure advantage weighting requires failure_mode_detection.enabled=True")
@@ -1610,7 +1615,7 @@ class RayPPOTrainer:
         if self.global_steps > self.total_training_steps:
             progress_bar.close()
             return
-        for epoch in range(start_epoch, self.config.trainer.total_epochs):
+        for epoch in range(start_epoch, self._training_epoch_count()):
             epoch_iterator = self._training_epoch_iterator()
             for batch_dict in epoch_iterator:
                 do_profile = (

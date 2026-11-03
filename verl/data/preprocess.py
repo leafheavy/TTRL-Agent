@@ -1,7 +1,9 @@
 import argparse
 import csv
+import hashlib
 import json
 import os
+import random
 from copy import deepcopy
 from pathlib import Path
 
@@ -23,20 +25,59 @@ MULTI_TURN_COLUMNS = (
 )
 
 
-def select_bfcl_inputs(categories, *, consensus="observations", fs_only=False, max_samples=0):
+def load_bfcl_seal_split(path=None):
+    """Validate the bundled SEAL scenario split; never infer it from file order."""
+    path = Path(path) if path is not None else Path(__file__).with_name("bfcl_400_split.json")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    scenarios = list(range(200))
+    random.Random(42).shuffle(scenarios)
+    if manifest.get("seed") != 42:
+        raise ValueError("The SEAL scenario split requires seed 42")
+    for key, indices in (("train", scenarios[:100]), ("test", scenarios[100:])):
+        ids = manifest.get(key)
+        expected = {f"{category}_{index}" for category, _ in MULTI_TURN_COLUMNS for index in indices}
+        if not isinstance(ids, list) or len(ids) != 400 or not all(isinstance(item, str) for item in ids):
+            raise ValueError(f"SEAL {key} must contain 400 unique official case IDs")
+        if len(set(ids)) != len(ids) or set(ids) != expected:
+            raise ValueError(f"SEAL {key} differs from the scenario-disjoint seed-42 split")
+    return manifest
+
+
+def select_bfcl_inputs(
+    categories, *, consensus="observations", fs_only=False, max_samples=0, split="all", partition="train"
+):
     """Select label-free Agent inputs with BFCL's existing category/data helpers."""
     from bfcl_eval.constants.eval_config import PROMPT_PATH
     from bfcl_eval.utils import find_file_by_category, load_file, parse_test_category_argument
 
     if consensus not in ("calls", "observations", "state") or max_samples < 0:
         raise ValueError("BFCL consensus must be calls/observations/state and max_samples must be non-negative")
+    if split not in ("all", "seal") or partition not in ("train", "heldout"):
+        raise ValueError("BFCL split must be all/seal and partition must be train/heldout")
+    if split == "all" and partition != "train":
+        raise ValueError("Heldout selection requires the SEAL split")
+    seal = load_bfcl_seal_split() if split == "seal" else None
+    selected_ids = set(seal["train" if partition == "train" else "test"]) if seal else None
     selected_categories = parse_test_category_argument(categories.split(","))
     supported = {"multi_turn_base", "multi_turn_miss_param", "multi_turn_miss_func", "multi_turn_long_context"}
     if set(selected_categories) - supported:
         raise ValueError("BFCL Agent input selection supports only the four local multi_turn categories")
     entries = []
     for category in selected_categories:
-        for entry in load_file(find_file_by_category(category, PROMPT_PATH), use_lock=False):
+        category_entries = load_file(find_file_by_category(category, PROMPT_PATH), use_lock=False)
+        if seal:
+            ids = [entry.get("id") for entry in category_entries]
+            expected = {f"{category}_{index}" for index in range(200)}
+            if not all(isinstance(case_id, str) for case_id in ids) or len(ids) != len(set(ids)):
+                raise ValueError(f"Installed BFCL inputs contain invalid or duplicate IDs for {category}")
+            if set(ids) != expected:
+                raise ValueError(
+                    f"Installed BFCL inputs do not cover the SEAL split for {category}: "
+                    f"missing={sorted(expected - set(ids))[:10]}, extra={sorted(set(ids) - expected)[:10]}"
+                )
+        for entry in category_entries:
+            if selected_ids is not None and entry["id"] not in selected_ids:
+                continue
             if (fs_only or consensus == "state") and entry.get("involved_classes") != ["GorillaFileSystem"]:
                 continue
             row = {key: deepcopy(entry[key]) for key in BFCL_INPUT_FIELDS if key in entry}
@@ -48,6 +89,58 @@ def select_bfcl_inputs(categories, *, consensus="observations", fs_only=False, m
     if not entries:
         raise ValueError("No BFCL Agent inputs remain after category/state selection")
     return entries
+
+
+def bfcl_case_ids(entries):
+    """Build the existing evaluator's category-to-ID mapping with strict IDs."""
+    from bfcl_eval.utils import extract_test_category_from_id
+
+    ids, seen = {}, set()
+    for entry in entries:
+        case_id = entry.get("id")
+        if not isinstance(case_id, str) or "_" not in case_id or case_id in seen:
+            raise ValueError(f"BFCL inputs require unique official case IDs: {case_id!r}")
+        seen.add(case_id)
+        ids.setdefault(extract_test_category_from_id(case_id), []).append(case_id)
+    return ids
+
+
+def prepare_bfcl_seal_data(
+    categories, output_dir, *, consensus="observations", fs_only=False, max_samples=0, eval_split="train"
+):
+    """Use SEAL IDs with this project's label-free preprocessing and evaluator."""
+    if eval_split not in ("train", "heldout"):
+        raise ValueError("BFCL evaluation split must be train/heldout")
+    selection = dict(consensus=consensus, fs_only=fs_only, split="seal")
+    entries = select_bfcl_inputs(categories, max_samples=max_samples, **selection)
+    # A training smoke-test cap must never change the reserved evaluation pool.
+    heldout = select_bfcl_inputs(categories, partition="heldout", **selection)
+    evaluation = entries if eval_split == "train" else heldout
+    case_ids = prepare_bfcl_data(entries, output_dir, None if eval_split == "train" else heldout)
+    source_path = Path(__file__).with_name("bfcl_400_split.json")
+    source = load_bfcl_seal_split(source_path)
+    metadata = {
+        "split": "seal", "eval_split": eval_split,
+        "setting": "same_case_adaptation" if eval_split == "train" else "heldout_generalization",
+        "source": {
+            "name": "SEAL bfcl_400_split.json", "path": "data/bfcl_400_split.json",
+            "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+            "seed": source["seed"], "rule": source["rule"],
+        },
+        "selection": {
+            "categories": list(bfcl_case_ids(entries)), "consensus": consensus,
+            "fs_only": fs_only, "max_samples": max_samples,
+        },
+        "train_case_ids": bfcl_case_ids(entries), "eval_case_ids": bfcl_case_ids(evaluation),
+        "heldout_case_ids": bfcl_case_ids(heldout),
+    }
+    for filename, content in (
+        ("train_case_ids.json", metadata["train_case_ids"]),
+        ("heldout_case_ids.json", metadata["heldout_case_ids"]),
+        ("split_manifest.json", metadata),
+    ):
+        (Path(output_dir) / filename).write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
+    return entries, case_ids
 
 
 def make_bfcl_map_fn(split):
@@ -110,21 +203,11 @@ def make_bfcl_map_fn(split):
 def prepare_bfcl_data(entries, output_dir, val_entries=None):
     """Default to the same cases for updates and fresh, post-update BFCL evaluation."""
     import datasets
-    from bfcl_eval.utils import extract_test_category_from_id
 
     if not entries or (val_entries is not None and not val_entries):
         raise ValueError("BFCL update/evaluation inputs must not be empty")
-    case_ids = {}
-    for rows in (entries, entries if val_entries is None else val_entries):
-        seen = set()
-        ids = {}
-        for entry in rows:
-            case_id = entry.get("id")
-            if not isinstance(case_id, str) or "_" not in case_id or case_id in seen:
-                raise ValueError(f"BFCL inputs require unique official case IDs: {case_id!r}")
-            seen.add(case_id)
-            ids.setdefault(extract_test_category_from_id(case_id), []).append(case_id)
-        case_ids = ids
+    bfcl_case_ids(entries)
+    case_ids = bfcl_case_ids(entries if val_entries is None else val_entries)
 
     process_fn = make_bfcl_map_fn("train")
     train_rows = [process_fn(entry, idx) for idx, entry in enumerate(entries)]
@@ -174,6 +257,7 @@ def summarize_bfcl_multi_turn(run_root, model, label):
     """
     run_root = Path(run_root)
     rows = []
+    protocols = []
     for category, _ in MULTI_TURN_COLUMNS:
         child = run_root / category
         cases = json.loads((child / "data" / "case_ids.json").read_text(encoding="utf-8"))
@@ -184,6 +268,25 @@ def summarize_bfcl_multi_turn(run_root, model, label):
             raise ValueError(f"Invalid case IDs for {category}")
         if len(ids) != len(set(ids)):
             raise ValueError(f"Invalid or duplicate case IDs for {category}")
+        manifest_path = child / "data" / "split_manifest.json"
+        protocol = None
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            eval_split = manifest.get("eval_split")
+            expected_setting = {"train": "same_case_adaptation", "heldout": "heldout_generalization"}
+            if (
+                manifest.get("split") != "seal" or eval_split not in expected_setting
+                or manifest.get("setting") != expected_setting[eval_split]
+                or manifest.get("eval_case_ids") != cases
+            ):
+                raise ValueError(f"Split protocol disagrees with evaluation case IDs for {category}")
+            protocol = {key: manifest[key] for key in ("split", "eval_split", "setting", "source")}
+            protocol["selection"] = {
+                key: manifest["selection"][key] for key in ("consensus", "fs_only", "max_samples")
+            }
+        protocols.append(protocol)
+        if protocol != protocols[0]:
+            raise ValueError("Cannot summarize categories with different or missing split protocols")
         check_bfcl_result_ids(cases, child / "eval" / "result")
         # Accept the installed BFCL data version; do not relabel v4 as v3.
         paths = list((child / "eval" / "score" / model.replace("/", "_")).rglob(
@@ -209,6 +312,8 @@ def summarize_bfcl_multi_turn(run_root, model, label):
         "setting": "independent_per_category_adaptation",
         "average_accuracy": average, "categories": rows,
     }
+    if protocols[0] is not None:
+        summary["data_protocol"] = protocols[0]
     (run_root / "multi_turn_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -225,8 +330,13 @@ def summarize_bfcl_multi_turn(run_root, model, label):
         "| " + " | ".join(["---"] + ["---:"] * (len(columns) - 1)) + " |",
         "| " + " | ".join(md_values) + " |",
     ))
+    evaluation_note = (
+        "在各自场景隔离的留出 case 上冻结评估，不对留出任务进行更新。"
+        if protocols[0] is not None and protocols[0]["eval_split"] == "heldout"
+        else "在各自同批 case 上重新生成并使用官方评分。"
+    )
     note = (
-        "各类别从同一原始模型独立训练，在各自同批 case 上重新生成并使用官方评分。"
+        "各类别从同一原始模型独立训练，" + evaluation_note +
         "Average 是四类准确率的算术平均；这是四个类别专用模型的汇总，不是单一模型的 BFCL 总分。"
     )
     (run_root / "multi_turn_summary.md").write_text(table + "\n\n" + note + "\n", encoding="utf-8")
@@ -272,7 +382,9 @@ if __name__ == "__main__":
         "--bfcl-categories", help="BFCL local Agent categories, comma-separated; accepts multi_turn"
     )
     bfcl_input.add_argument("--bfcl-check-results", help="Check generated result IDs against a case_ids.json manifest")
-    bfcl_input.add_argument("--bfcl-summarize-multi-turn", metavar="RUN_ROOT", help="Summarize four independent category runs")
+    bfcl_input.add_argument(
+        "--bfcl-summarize-multi-turn", metavar="RUN_ROOT", help="Summarize four independent category runs"
+    )
     parser.add_argument("--bfcl-model", default="Qwen/Qwen2.5-3B-Instruct-FC", help="Official BFCL model registry key")
     parser.add_argument("--bfcl-run-label", default="TTRL", help="Display label for the multi-turn summary row")
     parser.add_argument("--bfcl-result-dir", help="BFCL generated result directory, used with --bfcl-check-results")
@@ -280,8 +392,20 @@ if __name__ == "__main__":
     parser.add_argument("--bfcl-consensus", choices=("calls", "observations", "state"), default="observations")
     parser.add_argument("--bfcl-fs-only", action="store_true", help="Select only GorillaFileSystem tasks")
     parser.add_argument("--bfcl-max-samples", type=int, default=0, help="Limit selected inputs; 0 uses all")
+    parser.add_argument(
+        "--bfcl-split", choices=("all", "seal"), default="all",
+        help="all keeps legacy input selection; seal uses the bundled scenario-disjoint 100/100 split",
+    )
+    parser.add_argument(
+        "--bfcl-eval-split", choices=("train", "heldout"), default="train",
+        help="Evaluate the selected training cases, or reserve SEAL training cases and evaluate its heldout side",
+    )
     parser.add_argument("--output-dir", default="BFCL-TTRL")
     args = parser.parse_args()
+    if args.bfcl_split == "seal" and (not args.bfcl_categories or args.bfcl_val_json):
+        parser.error("--bfcl-split seal requires --bfcl-categories and cannot use --bfcl-val-json")
+    if args.bfcl_eval_split == "heldout" and args.bfcl_split != "seal":
+        parser.error("--bfcl-eval-split heldout requires --bfcl-split seal")
     if args.bfcl_val_json and not (args.bfcl_train_json or args.bfcl_categories):
         parser.error("--bfcl-val-json requires BFCL input selection")
     if bool(args.bfcl_check_results) != bool(args.bfcl_result_dir):
@@ -296,6 +420,15 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if args.bfcl_train_json or args.bfcl_categories:
         from bfcl_eval.utils import load_file
+
+        if args.bfcl_split == "seal":
+            entries, case_ids = prepare_bfcl_seal_data(
+                args.bfcl_categories, args.output_dir, consensus=args.bfcl_consensus,
+                fs_only=args.bfcl_fs_only, max_samples=args.bfcl_max_samples, eval_split=args.bfcl_eval_split,
+            )
+            print(f"BFCL SEAL update inputs: {len(entries)}; {args.bfcl_eval_split} evaluation inputs: "
+                  f"{sum(map(len, case_ids.values()))}")
+            raise SystemExit(0)
 
         # Load original JSONL before Arrow to preserve heterogeneous schemas/configuration.
         entries = (
