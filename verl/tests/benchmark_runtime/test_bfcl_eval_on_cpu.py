@@ -3,8 +3,10 @@
 import argparse
 import asyncio
 import importlib.util
+import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -165,8 +167,253 @@ class TestBaselineConfiguration(unittest.TestCase):
             self.prepare()
         self.assertFalse(Path(self.args.output_dir).exists())
 
+    def test_flat_reference_fingerprint_is_selected_by_case_ids(self):
+        for side, cases, temperature in (("train", self.cases, 0.7), ("heldout", {
+            "multi_turn_base": ["multi_turn_base_1"],
+        }, 0.001)):
+            directory = self.reference / f"eval_{side}"
+            directory.mkdir()
+            (directory / "test_case_ids_to_generate.json").write_text(json.dumps(cases), encoding="utf-8")
+            (directory / "bfcl_environment.json").write_text(json.dumps({"client": dict(
+                bfcl_model=self.args.bfcl_model, temperature=temperature, num_threads=1,
+            )}), encoding="utf-8")
+        self.args.case_ids = str(self.reference / "eval_heldout/test_case_ids_to_generate.json")
+        self.prepare()
+        manifest = json.loads((Path(self.args.output_dir) / "baseline_config.json").read_text(encoding="utf-8"))
+        expected = str(self.reference / "eval_heldout/bfcl_environment.json")
+        self.assertEqual(manifest["bfcl_reference_environment"], expected)
+        self.assertEqual(manifest["bfcl_reference_check"], "matched")
+        environment = (Path(self.args.output_dir) / "baseline.env").read_text(encoding="utf-8")
+        self.assertIn("export BASELINE_CASE_OVERRIDE=True", environment)
+        self.assertIn("export BASELINE_BFCL_REFERENCE_ENV=", environment)
+
+
+class TestFlatEvaluation(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="flat bfcl ")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.source = self.root / "cases.json"
+        self.cases = {"multi_turn_base": ["multi_turn_base_0", "multi_turn_base_9"]}
+        self.source.write_text(json.dumps(self.cases), encoding="utf-8")
+        self.args = argparse.Namespace(
+            evaluate_case_ids=str(self.source), output_dir=str(self.root / "eval_train"),
+            bfcl_model="Qwen/test-model-FC", local_model_path="original-model",
+            temperature=0.001, num_threads=1, compare_bfcl_env=None, score_only=False,
+        )
+        self.commands = []
+        self.run_bfcl = control._run_bfcl
+        self.utils = ModuleType("bfcl_eval.utils")
+        self.utils.get_directory_structure_by_category = lambda category: "multi_turn"
+        self.utils.find_file_by_category = lambda category, directory, **_: control._category_file(
+            directory, category, "result"
+        )
+        self.utils.load_file = lambda path, **_: [json.loads(line) for line in path.read_text().splitlines()]
+        self.stack = [
+            patch.dict(sys.modules, {"bfcl_eval.utils": self.utils}),
+            patch.object(control, "record_bfcl_environment", side_effect=self.fingerprint),
+            patch.object(control, "_probe_model"),
+            patch.object(control, "_run_bfcl", side_effect=self.run_cli),
+        ]
+        self.mocks = [item.start() for item in self.stack]
+        for item in self.stack:
+            self.addCleanup(item.stop)
+
+    @staticmethod
+    def fingerprint(output, compare=None, **kwargs):
+        result = dict(client=kwargs)
+        if compare and Path(compare).is_file():
+            if json.loads(Path(compare).read_text(encoding="utf-8")) != result:
+                raise ValueError("fingerprint differs")
+        Path(output).write_text(json.dumps(result), encoding="utf-8")
+
+    def run_cli(self, command, log, environment):
+        self.commands.append(command)
+        work = Path(environment["BFCL_PROJECT_ROOT"])
+        cases = json.loads((work / "test_case_ids_to_generate.json").read_text())
+        log.write_text("official CLI output\n", encoding="utf-8")
+        kind = "result" if command[0] == "generate" else "score"
+        for category, ids in cases.items():
+            destination = work / kind / self.args.bfcl_model.replace("/", "_") / "multi_turn"
+            destination.mkdir(parents=True, exist_ok=True)
+            rows = [{"id": case_id, "result": []} for case_id in ids] if kind == "result" else [
+                {"correct_count": 1, "total_count": len(ids), "accuracy": 1 / len(ids)},
+                {"id": ids[-1], "valid": False},
+            ]
+            (destination / f"BFCL_v4_{category}_{kind}.json").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+
+    def test_fixed_cases_are_generated_once_scored_and_published_without_subdirectories(self):
+        summary = control.evaluate_cases(self.args)
+        output = Path(self.args.output_dir)
+        self.assertEqual([command[0] for command in self.commands], ["generate", "evaluate"])
+        generate = self.commands[0]
+        self.assertIn("--run-ids", generate)
+        self.assertEqual(generate[generate.index("--local-model-path") + 1], "original-model")
+        self.assertEqual(summary["bfcl_model"], self.args.bfcl_model)
+        self.assertEqual(summary["average_accuracy"], 0.5)
+        self.assertEqual(summary["case_ids_sha256"], control._sha256(self.source))
+        self.assertEqual(summary["categories"][0]["total_count"], 2)
+        self.assertEqual(list(output.iterdir()), list(output.glob("*")))
+        self.assertFalse(any(path.is_dir() for path in output.iterdir()))
+        raw = output / "BFCL_v4_multi_turn_base_result.json"
+        self.assertEqual(
+            [json.loads(line)["id"] for line in raw.read_text().splitlines()], self.cases["multi_turn_base"]
+        )
+        self.assertTrue((output / "BFCL_v4_multi_turn_base_score.json").is_file())
+        self.mocks[2].assert_called_once_with("original-model", output)
+        with self.assertRaises(FileExistsError):
+            control.evaluate_cases(self.args)
+
+    def test_generation_failure_retains_partial_raw_results_and_never_scores_or_summarizes(self):
+        def fail(command, log, environment):
+            self.run_cli(command, log, environment)
+            raise subprocess.CalledProcessError(9, command)
+
+        self.mocks[3].side_effect = fail
+        with self.assertRaises(subprocess.CalledProcessError):
+            control.evaluate_cases(self.args)
+        output = Path(self.args.output_dir)
+        self.assertTrue((output / "generate.log").is_file())
+        self.assertTrue((output / "BFCL_v4_multi_turn_base_result.json").is_file())
+        self.assertFalse((output / "summary.json").exists())
+        self.assertFalse(any(path.is_dir() for path in output.iterdir()))
+        self.assertEqual([command[0] for command in self.commands], ["generate"])
+
+    def test_partial_duplicate_or_extra_results_cannot_reach_official_scoring(self):
+        for ids in (["multi_turn_base_0"], ["multi_turn_base_0"] * 2, ["multi_turn_base_0", "multi_turn_base_1"]):
+            with self.subTest(ids=ids):
+                self.args.output_dir = str(self.root / str(len(list(self.root.iterdir()))))
+
+                def incomplete(command, log, environment, selected_ids=ids):
+                    self.run_cli(command, log, environment)
+                    path = control._category_file(Path(environment["BFCL_PROJECT_ROOT"]) / "result",
+                                                  "multi_turn_base", "result")
+                    path.write_text(
+                        "".join(json.dumps({"id": value}) + "\n" for value in selected_ids), encoding="utf-8"
+                    )
+
+                self.mocks[3].side_effect = incomplete
+                self.commands.clear()
+                with self.assertRaises(ValueError):
+                    control.evaluate_cases(self.args)
+                self.assertEqual([command[0] for command in self.commands], ["generate"])
+                self.assertFalse((Path(self.args.output_dir) / "summary.json").exists())
+
+    def test_bad_official_counts_prevent_publishing_a_success_summary(self):
+        def wrong_count(command, log, environment):
+            self.run_cli(command, log, environment)
+            if command[0] == "evaluate":
+                path = control._category_file(Path(environment["BFCL_PROJECT_ROOT"]) / "score",
+                                              "multi_turn_base", "score")
+                path.write_text('{"correct_count": 1, "total_count": 1}\n', encoding="utf-8")
+
+        self.mocks[3].side_effect = wrong_count
+        with self.assertRaisesRegex(ValueError, "score counts disagree"):
+            control.evaluate_cases(self.args)
+        self.assertFalse((Path(self.args.output_dir) / "summary.json").exists())
+
+    def test_score_only_reconstructs_official_layout_without_inference_and_checks_saved_ids(self):
+        control.evaluate_cases(self.args)
+        self.commands.clear()
+        self.mocks[2].reset_mock()
+        self.args.score_only = True
+        control.evaluate_cases(self.args)
+        self.assertEqual([command[0] for command in self.commands], ["evaluate"])
+        self.mocks[2].assert_not_called()
+        self.assertFalse(any(path.is_dir() for path in Path(self.args.output_dir).iterdir()))
+        self.source.write_text(json.dumps({"multi_turn_base": ["multi_turn_base_0"]}), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "case IDs differ"):
+            control.evaluate_cases(self.args)
+
+    def test_score_only_fingerprint_mismatch_preserves_the_previous_record(self):
+        control.evaluate_cases(self.args)
+        fingerprint = Path(self.args.output_dir) / "bfcl_environment.json"
+        before = fingerprint.read_bytes()
+        self.args.score_only = True
+        self.args.temperature = 0.6
+        self.commands.clear()
+        with self.assertRaisesRegex(ValueError, "fingerprint differs"):
+            control.evaluate_cases(self.args)
+        self.assertEqual(fingerprint.read_bytes(), before)
+        self.assertEqual(self.commands, [])
+
+    def test_failed_rescore_invalidates_the_previous_success_summary(self):
+        control.evaluate_cases(self.args)
+        self.args.score_only = True
+        self.mocks[3].side_effect = subprocess.CalledProcessError(7, ["evaluate"])
+        with self.assertRaises(subprocess.CalledProcessError):
+            control.evaluate_cases(self.args)
+        output = Path(self.args.output_dir)
+        self.assertFalse((output / "summary.json").exists())
+        self.assertTrue((output / "BFCL_v4_multi_turn_base_result.json").is_file())
+
+    def test_cli_evaluation_dispatch_does_not_import_a_gpu_engine(self):
+        with patch.object(control, "evaluate_cases") as evaluate, patch.dict(sys.modules, {"vllm": None}):
+            control.main(["--evaluate-case-ids", str(self.source), "--output-dir", self.args.output_dir,
+                          "--bfcl-model", self.args.bfcl_model, "--local-model-path", "original-model"])
+        evaluate.assert_called_once()
+        self.assertEqual(evaluate.call_args.args[0].evaluate_case_ids, str(self.source))
+
+    def test_subprocess_log_streaming_uses_current_interpreter_and_rejects_a_swallowed_404(self):
+        process = Mock()
+        process.__enter__ = Mock(return_value=process)
+        process.__exit__ = Mock(return_value=False)
+        process.stdout = ["Error code: 404 The model original-model does not exist\n"]
+        process.wait.return_value = 0
+        process.args = ["fake"]
+        with patch.object(control.subprocess, "Popen", return_value=process) as popen:
+            with self.assertRaisesRegex(RuntimeError, "404"):
+                self.run_bfcl(["generate", "--run-ids"], self.root / "generate.log", {"test": "env"})
+        self.assertEqual(popen.call_args.args[0], [sys.executable, "-m", "bfcl_eval", "generate", "--run-ids"])
+
 
 class TestBFCLRuntimeParity(unittest.TestCase):
+    def test_absolute_script_fingerprints_the_installed_package_instead_of_itself(self):
+        with tempfile.TemporaryDirectory(prefix="bfcl script import ") as temporary:
+            root = Path(temporary)
+            package = root / "bfcl_eval"
+            package.mkdir()
+            (package / "__init__.py").write_text("# independently installed benchmark\n", encoding="utf-8")
+            data = package / "data"
+            data.mkdir()
+            (data / "tasks.json").write_text('{"id":"task_0"}', encoding="utf-8")
+            output = root / "fingerprint.json"
+            result = subprocess.run([
+                sys.executable, str(ROOT / "verl/utils/bfcl_eval.py"), "--record-bfcl-env", str(output),
+                "--bfcl-model", "test-FC",
+            ], cwd=root, env=dict(os.environ, PYTHONPATH=str(root), PYTHONUTF8="1"),
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            recorded = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(recorded["code_sha256"], control._fingerprint_files(package, package.rglob("*.py")))
+            self.assertEqual(recorded["data_sha256"], control._fingerprint_files(package, data.rglob("*.json")))
+
+    def test_short_probe_checks_the_actual_model_and_completion_before_evaluation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            opener = Mock()
+            opener.open.side_effect = [
+                io.BytesIO(b'{"data":[{"id":"actual-model"}]}'),
+                io.BytesIO(b'{"choices":[{"text":"Hello"}]}'),
+            ]
+            with patch.object(control, "build_opener", return_value=opener), patch.dict(os.environ, {
+                "REMOTE_OPENAI_BASE_URL": "http://127.0.0.1:1234/v1", "REMOTE_OPENAI_API_KEY": "EMPTY",
+            }):
+                control._probe_model("actual-model", output)
+            request = opener.open.call_args_list[1].args[0]
+            payload = json.loads(request.data)
+            self.assertEqual(payload["model"], "actual-model")
+            self.assertEqual(payload["max_tokens"], 8)
+            self.assertEqual(payload["n"], 1)
+            self.assertTrue(json.loads((output / "inference_probe.json").read_text())["ok"])
+            opener.open.side_effect = [io.BytesIO(b'{"data":[{"id":"other-model"}]}')]
+            with patch.object(control, "build_opener", return_value=opener), patch.dict(os.environ, {
+                "REMOTE_OPENAI_BASE_URL": "http://127.0.0.1:1234/v1",
+            }), self.assertRaisesRegex(RuntimeError, "is absent"):
+                control._probe_model("actual-model", output)
+
     def test_baseline_cli_matches_training_backend_environment(self):
         vllm = ModuleType("vllm")
         vllm.SamplingParams = SamplingParams

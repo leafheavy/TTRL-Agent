@@ -1216,6 +1216,7 @@ class TestIndependentMultiTurnLauncher(unittest.TestCase):
               trap '"$REAL_PYTHON" "$FAKE_DISPATCH" runtime_stop; exit 0' TERM INT
               while true; do sleep 0.1; done
             fi
+            if [ "${1:-}" = -u ]; then shift; fi
             exec "$REAL_PYTHON" "$FAKE_DISPATCH" "$@"
         ''').encode("utf-8"))
         self.interpreter.chmod(0o755)
@@ -1304,8 +1305,36 @@ class TestIndependentMultiTurnLauncher(unittest.TestCase):
                     sys.argv = args
                     runpy.run_path(args[0], run_name="__main__")
             elif args[0].endswith("utils/bfcl_eval.py"):
-                path(value("--record-bfcl-env")).write_text("{}")
-                event("eval_environment", category=category)
+                from urllib.request import Request, urlopen
+                output = path(value("--output-dir"))
+                category = output.parent.name
+                evaluation = output.name.removeprefix("eval_")
+                output.mkdir()
+                cases = json.loads(path(value("--evaluate-case-ids")).read_text())
+                (output / "test_case_ids_to_generate.json").write_text(json.dumps(cases))
+                model = value("--local-model-path")
+                base = os.environ["REMOTE_OPENAI_BASE_URL"].rstrip("/")
+                with urlopen(base + "/models") as response:
+                    assert model in [item["id"] for item in json.load(response)["data"]]
+                request = Request(base + "/completions", data=json.dumps({"model": model}).encode(),
+                                  headers={"Content-Type": "application/json"})
+                with urlopen(request) as response:
+                    assert json.load(response)["choices"]
+                if "--compare-bfcl-env" in args:
+                    assert path(value("--compare-bfcl-env")).is_file()
+                (output / "bfcl_environment.json").write_text("{}")
+                event("eval_environment", category=category, evaluation=evaluation)
+                event("generate", category=category, evaluation=evaluation, cases=cases, model=model,
+                      base_url=base, arguments=args)
+                if (category == os.environ.get("FAKE_FAIL_GENERATE") or
+                    (evaluation == "heldout" and category == os.environ.get("FAKE_FAIL_HELDOUT"))):
+                    (output.parent / "abort_train").touch()
+                    sys.exit(9)
+                (output / ("BFCL_v4_" + category + "_result.json")).write_text("{}")
+                event("check_results", category=category, evaluation=evaluation)
+                event("evaluate", category=category, evaluation=evaluation, arguments=args)
+                (output / ("BFCL_v4_" + category + "_score.json")).write_text("{}")
+                (output / "summary.json").write_text("{}")
             elif args[0] == "data/preprocess.py":
                 if "--bfcl-categories" in args:
                     category = value("--bfcl-categories")
@@ -1316,6 +1345,8 @@ class TestIndependentMultiTurnLauncher(unittest.TestCase):
                     evaluation = value("--bfcl-eval-split")
                     selected = category + ("_1" if evaluation == "heldout" else "_0")
                     (output / "case_ids.json").write_text(json.dumps({category: [selected]}))
+                    (output / "train_case_ids.json").write_text(json.dumps({category: [category + "_0"]}))
+                    (output / "heldout_case_ids.json").write_text(json.dumps({category: [category + "_1"]}))
                     event("preprocess", category=category, split=value("--bfcl-split"), evaluation=evaluation)
                 elif "--bfcl-check-results" in args:
                     assert (project / "result" / "generated.json").is_file()
@@ -1437,9 +1468,26 @@ class TestIndependentMultiTurnLauncher(unittest.TestCase):
                 if os.name == "nt" and re.match(r"^/[a-zA-Z]/", actual):
                     actual = actual[1] + ":" + actual[2:]
                 self.assertEqual(Path(actual).resolve(), expected, (category, key))
-            for kind in ("preprocess", "health", "model_probe", "generate", "check_results", "evaluate",
-                         "train_stopped", "runtime_stop"):
+            for kind in ("preprocess", "health", "train_stopped", "runtime_stop"):
                 self.assertEqual(sum(item["kind"] == kind and item["category"] == category for item in events), 1)
+            for kind in ("model_probe", "generate", "check_results", "evaluate"):
+                self.assertEqual(sum(item["kind"] == kind and item["category"] == category for item in events), 2)
+            evaluated = [item for item in events if item["kind"] == "evaluate" and item["category"] == category]
+            self.assertEqual([item["evaluation"] for item in evaluated], ["train", "heldout"])
+            for side, index in (("train", 0), ("heldout", 1)):
+                selected = json.loads((child / f"eval_{side}/test_case_ids_to_generate.json").read_text())
+                self.assertEqual(selected, {category: [f"{category}_{index}"]})
+                self.assertTrue((child / f"eval_{side}/BFCL_v4_{category}_score.json").is_file())
+                self.assertFalse((child / f"eval_{side}/result").exists())
+                self.assertFalse((child / f"eval_{side}/score").exists())
+            generated = [item for item in events if item["kind"] == "generate" and item["category"] == category]
+            self.assertEqual(len({item["base_url"] for item in generated}), 1)
+            self.assertEqual({item["model"] for item in generated}, {self.model.as_posix()})
+            stopped = next(i for i, item in enumerate(events)
+                           if item["kind"] == "train_stopped" and item["category"] == category)
+            last_eval = max(i for i, item in enumerate(events)
+                            if item["kind"] == "evaluate" and item["category"] == category)
+            self.assertLess(last_eval, stopped)
             if category != self.categories[-1]:
                 stopped = next(i for i, item in enumerate(events)
                                if item["kind"] == "runtime_stop" and item["category"] == category)
@@ -1454,7 +1502,9 @@ class TestIndependentMultiTurnLauncher(unittest.TestCase):
                 self.assertEqual((event["split"], event["evaluation"]), ("seal", "train"))
         configuration = (self.suite / self.categories[0] / "run.env").read_text(encoding="utf-8")
         self.assertIn("export BFCL_SPLIT=seal", configuration)
-        self.assertIn("export BFCL_EVAL_SPLIT=train", configuration)
+        self.assertIn("export BFCL_EVAL_SPLIT=both", configuration)
+        self.assertIn("--bfcl-eval-splits", events[-1]["arguments"])
+        self.assertIn("train,heldout", events[-1]["arguments"])
         result, repeated = self.launch()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("fresh RUN_ROOT", result.stdout)
@@ -1510,6 +1560,15 @@ class TestIndependentMultiTurnLauncher(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual([event["category"] for event in events if event["kind"] == "train"], [self.categories[0]])
         self.assertFalse(any(event["kind"] in ("evaluate", "summary") for event in events))
+        self.assertFalse((self.suite / self.categories[1]).exists())
+
+    def test_heldout_failure_stops_before_next_category_and_publishing_summary(self):
+        result, events = self.launch(FAKE_FAIL_HELDOUT=self.categories[0])
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        evaluations = [event for event in events if event["kind"] == "evaluate"]
+        self.assertEqual([(event["category"], event["evaluation"]) for event in evaluations],
+                         [(self.categories[0], "train")])
+        self.assertFalse(any(event["kind"] == "summary" for event in events))
         self.assertFalse((self.suite / self.categories[1]).exists())
 
     def test_foreign_runtime_identity_failure_leaves_the_unrelated_listener_running(self):

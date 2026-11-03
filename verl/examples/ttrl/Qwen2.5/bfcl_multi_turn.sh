@@ -13,12 +13,22 @@ export TRAIN_PYTHON
 BFCL_MODEL=${BFCL_MODEL:-Qwen/$(basename "$MODEL_PATH")-FC}
 CONSENSUS=${CONSENSUS:-observations}
 BFCL_SPLIT=${BFCL_SPLIT:-seal}
-BFCL_EVAL_SPLIT=${BFCL_EVAL_SPLIT:-train}
+if [ -z "${BFCL_EVAL_SPLIT:-}" ]; then
+  BFCL_EVAL_SPLIT=both
+  if [ "$BFCL_SPLIT" = all ]; then BFCL_EVAL_SPLIT=train; fi
+fi
 export BFCL_SPLIT BFCL_EVAL_SPLIT
 case "$BFCL_SPLIT:$BFCL_EVAL_SPLIT" in
-  seal:train|seal:heldout|all:train) ;;
-  *) echo 'Use BFCL_SPLIT=seal with BFCL_EVAL_SPLIT=train/heldout, or all:train for legacy runs.' >&2; exit 1 ;;
+  seal:both|seal:train|seal:heldout|all:train) ;;
+  *) echo 'Use BFCL_SPLIT=seal with BFCL_EVAL_SPLIT=both/train/heldout, or all:train for legacy runs.' >&2; exit 1 ;;
 esac
+DATA_EVAL_SPLIT=$BFCL_EVAL_SPLIT
+EVAL_SPLITS=$BFCL_EVAL_SPLIT
+if [ "$BFCL_EVAL_SPLIT" = both ]; then
+  DATA_EVAL_SPLIT=train
+  EVAL_SPLITS=train,heldout
+fi
+IFS=, read -r -a EVALUATIONS <<< "$EVAL_SPLITS"
 ENDPOINT=${BENCHMARK_RUNTIME_ENDPOINT:-http://127.0.0.1:1054}
 POST_EVAL=False
 TTRL_ENABLED=True
@@ -90,11 +100,12 @@ trap 'exit 143' TERM
 
 for category in "${CATEGORIES[@]}"; do
   child_root="$SUITE_ROOT/$category"
-  mkdir -p "$child_root/data" "$child_root/eval"
-  export BFCL_PROJECT_ROOT="$child_root/eval"
+  mkdir -p "$child_root/data"
+  # The tool runtime's BFCL locks/cache are separate from the two flat evaluations.
+  export BFCL_PROJECT_ROOT="$child_root/.bfcl_runtime"
   echo "[multi_turn] $category: original model=$MODEL_PATH; output=$child_root"
   data_args=(--bfcl-categories "$category" --bfcl-consensus "$CONSENSUS"
-    --bfcl-split "$BFCL_SPLIT" --bfcl-eval-split "$BFCL_EVAL_SPLIT"
+    --bfcl-split "$BFCL_SPLIT" --bfcl-eval-split "$DATA_EVAL_SPLIT"
     --bfcl-max-samples "${MAX_TRAIN_SAMPLES:-0}" --output-dir "$child_root/data")
   if [ "${FS_ONLY:-False}" = True ]; then data_args+=(--bfcl-fs-only); fi
   "$BFCL_PYTHON" data/preprocess.py "${data_args[@]}" > "$child_root/preprocess.log" 2>&1
@@ -155,45 +166,20 @@ for category in "${CATEGORIES[@]}"; do
   source "$child_root/post_train_eval/server.env"
   export NO_PROXY="${NO_PROXY:+$NO_PROXY,}${LOCAL_SERVER_ENDPOINT},127.0.0.1,localhost"
   export no_proxy="$NO_PROXY"
-  "$TRAIN_PYTHON" - <<'PY'
-import json
-import os
-from pathlib import Path
-from urllib.request import ProxyHandler, Request, build_opener
-
-base = os.environ["REMOTE_OPENAI_BASE_URL"].rstrip("/")
-model = os.environ["REMOTE_OPENAI_TOKENIZER_PATH"]
-opener = build_opener(ProxyHandler({}))
-with opener.open(base + "/models", timeout=10) as response:
-    names = [item["id"] for item in json.load(response)["data"]]
-if model not in names:
-    raise RuntimeError(f"BFCL request model {model!r} is absent from {names!r}")
-payload = {"model": model, "prompt": "Hello", "max_tokens": 8, "temperature": 0}
-request = Request(base + "/completions", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
-with opener.open(request, timeout=60) as response:
-    result = json.load(response)
-if not result.get("choices"):
-    raise RuntimeError(f"Model probe returned no choices: {result}")
-(Path(os.environ["BFCL_PROJECT_ROOT"]) / "inference_probe.json").write_text(
-    json.dumps({"model": model, "served_models": names, "ok": True}, indent=2), encoding="utf-8")
-PY
-  cp "$child_root/data/case_ids.json" "$BFCL_PROJECT_ROOT/test_case_ids_to_generate.json"
-  "$BFCL_PYTHON" verl/utils/bfcl_eval.py --record-bfcl-env "$child_root/eval/bfcl_environment.json" \
-    --bfcl-model "$BFCL_MODEL" --temperature "${BFCL_EVAL_TEMPERATURE:-0.001}" \
-    --num-threads "${BFCL_NUM_THREADS:-1}"
-  "$BFCL_PYTHON" -m bfcl_eval generate --model "$BFCL_MODEL" \
-    --local-model-path "$REMOTE_OPENAI_TOKENIZER_PATH" --run-ids \
-    --backend vllm --skip-server-setup --temperature "${BFCL_EVAL_TEMPERATURE:-0.001}" \
-    --num-threads "${BFCL_NUM_THREADS:-1}" \
-    2>&1 | tee "$child_root/eval/generate.log"
-  if grep -Eq '(Error code: 404|openai[.]NotFoundError).*The model .*does not exist' "$child_root/eval/generate.log"; then
-    echo 'Model-service 404; aborting before scoring.' >&2
-    exit 1
-  fi
-  "$BFCL_PYTHON" data/preprocess.py --bfcl-check-results "$child_root/data/case_ids.json" \
-    --bfcl-result-dir "$child_root/eval/result"
-  "$BFCL_PYTHON" -m bfcl_eval evaluate --model "$BFCL_MODEL" \
-    --test-category "$category" --partial-eval 2>&1 | tee "$child_root/eval/evaluate.log"
+  evaluation_reference=
+  for evaluation in "${EVALUATIONS[@]}"; do
+    case_source="$child_root/data/${evaluation}_case_ids.json"
+    if [ "$BFCL_SPLIT" = all ]; then case_source="$child_root/data/case_ids.json"; fi
+    eval_args=(--evaluate-case-ids "$case_source" --output-dir "$child_root/eval_$evaluation"
+      --bfcl-model "$BFCL_MODEL" --local-model-path "$REMOTE_OPENAI_TOKENIZER_PATH"
+      --temperature "${BFCL_EVAL_TEMPERATURE:-0.001}" --num-threads "${BFCL_NUM_THREADS:-1}")
+    if [ -n "$evaluation_reference" ]; then
+      eval_args+=(--compare-bfcl-env "$evaluation_reference")
+    fi
+    echo "[multi_turn] Evaluating $category/$evaluation using the same frozen actor."
+    "$BFCL_PYTHON" -u verl/utils/bfcl_eval.py "${eval_args[@]}"
+    evaluation_reference="$child_root/eval_$evaluation/bfcl_environment.json"
+  done
   touch "$child_root/post_train_eval/stop"
   # main_ppo waits for its Ray/vLLM children to exit; a cleanup failure aborts
   # the suite here instead of loading the next category on top of old workers.
@@ -206,4 +192,4 @@ PY
   echo "[multi_turn] Completed $category; model and optimizer discarded."
 done
 "$BFCL_PYTHON" data/preprocess.py --bfcl-summarize-multi-turn "$SUITE_ROOT" \
-  --bfcl-model "$BFCL_MODEL" --bfcl-run-label "$RUN_LABEL"
+  --bfcl-model "$BFCL_MODEL" --bfcl-run-label "$RUN_LABEL" --bfcl-eval-splits "$EVAL_SPLITS"

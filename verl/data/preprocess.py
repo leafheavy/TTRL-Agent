@@ -249,7 +249,54 @@ def check_bfcl_result_ids(case_ids, result_dir):
             )
 
 
-def summarize_bfcl_multi_turn(run_root, model, label):
+def _flat_bfcl_summary_protocol(child, category, evaluation, cases):
+    """Check each flat evaluation against the recorded, isolated training split."""
+    manifest_path = child / "data" / "split_manifest.json"
+    if not manifest_path.is_file():
+        if evaluation != "train":
+            raise ValueError("Heldout evaluation requires a recorded SEAL split")
+        expected = json.loads((child / "data" / "case_ids.json").read_text(encoding="utf-8"))
+        if cases != expected:
+            raise ValueError(f"Evaluation case IDs disagree with training data for {category}")
+        return None
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source_path = Path(__file__).with_name("bfcl_400_split.json")
+    source = load_bfcl_seal_split(source_path)
+    expected_setting = {"train": "same_case_adaptation", "heldout": "heldout_generalization"}
+    recorded_side = manifest.get("eval_split")
+    if (
+        manifest.get("split") != "seal" or recorded_side not in expected_setting
+        or manifest.get("setting") != expected_setting[recorded_side]
+        or manifest.get("source", {}).get("sha256") != hashlib.sha256(source_path.read_bytes()).hexdigest()
+    ):
+        raise ValueError(f"Invalid recorded SEAL split for {category}")
+    partitions = {}
+    for side, source_key in (("train", "train"), ("heldout", "test")):
+        selected = json.loads((child / "data" / f"{side}_case_ids.json").read_text(encoding="utf-8"))
+        ids = selected.get(category) if isinstance(selected, dict) else None
+        if (
+            not isinstance(ids, list) or not ids or set(selected) != {category}
+            or not all(isinstance(case_id, str) and case_id.startswith(category + "_") for case_id in ids)
+            or len(ids) != len(set(ids)) or not set(ids) <= set(source[source_key])
+            or selected != manifest.get(f"{side}_case_ids")
+        ):
+            raise ValueError(f"Invalid or inconsistent {side} case IDs for {category}")
+        partitions[side] = selected
+    train_scenarios = {case_id.rsplit("_", 1)[-1] for case_id in partitions["train"][category]}
+    heldout_scenarios = {case_id.rsplit("_", 1)[-1] for case_id in partitions["heldout"][category]}
+    if train_scenarios & heldout_scenarios:
+        raise ValueError(f"Train and heldout scenarios overlap for {category}")
+    if manifest.get("eval_case_ids") != partitions[recorded_side] or cases != partitions[evaluation]:
+        raise ValueError(f"Split protocol disagrees with evaluation case IDs for {category}")
+    return {
+        "split": "seal", "eval_split": evaluation, "setting": expected_setting[evaluation],
+        "source": manifest["source"],
+        "selection": {key: manifest["selection"][key] for key in ("consensus", "fs_only", "max_samples")},
+    }
+
+
+def _collect_bfcl_multi_turn(run_root, model, label, evaluation=None):
     """Report four independently adapted models using official score counts.
 
     Average is the unweighted mean of the four category accuracies, even when
@@ -260,7 +307,10 @@ def summarize_bfcl_multi_turn(run_root, model, label):
     protocols = []
     for category, _ in MULTI_TURN_COLUMNS:
         child = run_root / category
-        cases = json.loads((child / "data" / "case_ids.json").read_text(encoding="utf-8"))
+        evaluation_dir = child / "eval" if evaluation is None else child / f"eval_{evaluation}"
+        case_path = (child / "data" / "case_ids.json" if evaluation is None
+                     else evaluation_dir / "test_case_ids_to_generate.json")
+        cases = json.loads(case_path.read_text(encoding="utf-8"))
         if set(cases) != {category} or not isinstance(cases[category], list) or not cases[category]:
             raise ValueError(f"Expected exactly the selected {category} cases in {child}")
         ids = cases[category]
@@ -270,7 +320,9 @@ def summarize_bfcl_multi_turn(run_root, model, label):
             raise ValueError(f"Invalid or duplicate case IDs for {category}")
         manifest_path = child / "data" / "split_manifest.json"
         protocol = None
-        if manifest_path.is_file():
+        if evaluation is not None:
+            protocol = _flat_bfcl_summary_protocol(child, category, evaluation, cases)
+        elif manifest_path.is_file():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             eval_split = manifest.get("eval_split")
             expected_setting = {"train": "same_case_adaptation", "heldout": "heldout_generalization"}
@@ -287,11 +339,10 @@ def summarize_bfcl_multi_turn(run_root, model, label):
         protocols.append(protocol)
         if protocol != protocols[0]:
             raise ValueError("Cannot summarize categories with different or missing split protocols")
-        check_bfcl_result_ids(cases, child / "eval" / "result")
+        check_bfcl_result_ids(cases, evaluation_dir / "result" if evaluation is None else evaluation_dir)
         # Accept the installed BFCL data version; do not relabel v4 as v3.
-        paths = list((child / "eval" / "score" / model.replace("/", "_")).rglob(
-            f"BFCL_v*_{category}_score.json"
-        ))
+        score_dir = evaluation_dir / "score" / model.replace("/", "_") if evaluation is None else evaluation_dir
+        paths = list(score_dir.rglob(f"BFCL_v*_{category}_score.json"))
         if len(paths) != 1:
             raise ValueError(f"Expected one official score file for {category}, got {paths}")
         with paths[0].open(encoding="utf-8") as handle:
@@ -302,6 +353,16 @@ def summarize_bfcl_multi_turn(run_root, model, label):
             or total != len(ids) or not 0 <= correct <= total
         ):
             raise ValueError(f"Official score counts disagree with selected cases for {category}: {header}")
+        if evaluation is not None:
+            completed = json.loads((evaluation_dir / "summary.json").read_text(encoding="utf-8"))
+            expected_counts = [(category, correct, total)]
+            counts = [(row["category"], row["correct_count"], row["total_count"])
+                      for row in completed.get("categories", [])]
+            if (
+                completed.get("bfcl_model") != model or counts != expected_counts
+                or completed.get("case_ids_sha256") != hashlib.sha256(case_path.read_bytes()).hexdigest()
+            ):
+                raise ValueError(f"Completed evaluation metadata disagrees with official outputs for {category}")
         rows.append({
             "category": category, "correct_count": correct, "total_count": total,
             "accuracy": correct / total, "score_file": str(paths[0]), "run_root": str(child),
@@ -314,27 +375,47 @@ def summarize_bfcl_multi_turn(run_root, model, label):
     }
     if protocols[0] is not None:
         summary["data_protocol"] = protocols[0]
+    if evaluation is not None:
+        summary["evaluation"] = evaluation
+    return summary
+
+
+def _write_bfcl_multi_turn_summary(run_root, summaries):
+    """Publish only after all requested categories and evaluation sides pass checks."""
+    summary = summaries[0] if len(summaries) == 1 else {
+        "label": summaries[0]["label"], "model_registry": summaries[0]["model_registry"],
+        "setting": "independent_per_category_adaptation",
+        "evaluations": {item["evaluation"]: item for item in summaries},
+    }
     (run_root / "multi_turn_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    columns = ["Model", "Average (%)"] + [title for _, title in MULTI_TURN_COLUMNS]
-    values = [label, f"{100 * average:.2f}"] + [f"{100 * row['accuracy']:.2f}" for row in rows]
+    separate_evaluations = "evaluation" in summaries[0]
+    columns = ["Model"] + (["Evaluation"] if separate_evaluations else [])
+    columns += ["Average (%)"] + [title for _, title in MULTI_TURN_COLUMNS]
+    values = []
+    for item in summaries:
+        row = [item["label"]] + ([item["evaluation"]] if separate_evaluations else [])
+        row += [f"{100 * item['average_accuracy']:.2f}"]
+        values.append(row + [f"{100 * category['accuracy']:.2f}" for category in item["categories"]])
     with (run_root / "multi_turn_summary.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(columns)
-        writer.writerow(values)
+        writer.writerows(values)
     # The first cell can contain user-provided names; escape Markdown syntax.
-    md_values = [values[0].replace("|", "\\|").replace("\n", " ")] + values[1:]
+    md_values = [[row[0].replace("|", "\\|").replace("\n", " ")] + row[1:] for row in values]
     table = "\n".join((
         "| " + " | ".join(columns) + " |",
         "| " + " | ".join(["---"] + ["---:"] * (len(columns) - 1)) + " |",
-        "| " + " | ".join(md_values) + " |",
+        *("| " + " | ".join(row) + " |" for row in md_values),
     ))
     evaluation_note = (
         "在各自场景隔离的留出 case 上冻结评估，不对留出任务进行更新。"
-        if protocols[0] is not None and protocols[0]["eval_split"] == "heldout"
+        if summaries[0].get("data_protocol", {}).get("eval_split") == "heldout"
         else "在各自同批 case 上重新生成并使用官方评分。"
     )
+    if len(summaries) > 1:
+        evaluation_note = "同一最终 actor 分别完成 train 同题评分与 heldout 未见场景评分；两次评测之间不更新参数。"
     note = (
         "各类别从同一原始模型独立训练，" + evaluation_note +
         "Average 是四类准确率的算术平均；这是四个类别专用模型的汇总，不是单一模型的 BFCL 总分。"
@@ -343,6 +424,22 @@ def summarize_bfcl_multi_turn(run_root, model, label):
     print(table)
     print(f"Summary: {run_root / 'multi_turn_summary.md'}")
     return summary
+
+
+def summarize_bfcl_multi_turn(run_root, model, label, eval_splits=None):
+    """Summarize paired flat evaluations, while accepting historical BFCL layouts."""
+    run_root = Path(run_root)
+    if isinstance(eval_splits, str):
+        eval_splits = eval_splits.split(",")
+    if eval_splits is None:
+        eval_splits = [side for side in ("train", "heldout")
+                       if any((run_root / category / f"eval_{side}").exists() for category, _ in MULTI_TURN_COLUMNS)]
+    if not eval_splits:
+        return _write_bfcl_multi_turn_summary(run_root, [_collect_bfcl_multi_turn(run_root, model, label)])
+    if len(set(eval_splits)) != len(eval_splits) or set(eval_splits) - {"train", "heldout"}:
+        raise ValueError("Requested evaluation sides must be distinct train/heldout values")
+    summaries = [_collect_bfcl_multi_turn(run_root, model, label, side) for side in eval_splits]
+    return _write_bfcl_multi_turn_summary(run_root, summaries)
 
 
 def make_map_fn(split, source=None):
@@ -387,6 +484,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--bfcl-model", default="Qwen/Qwen2.5-3B-Instruct-FC", help="Official BFCL model registry key")
     parser.add_argument("--bfcl-run-label", default="TTRL", help="Display label for the multi-turn summary row")
+    parser.add_argument("--bfcl-eval-splits", help="Required summary sides, comma-separated: train,heldout")
     parser.add_argument("--bfcl-result-dir", help="BFCL generated result directory, used with --bfcl-check-results")
     parser.add_argument("--bfcl-val-json")
     parser.add_argument("--bfcl-consensus", choices=("calls", "observations", "state"), default="observations")
@@ -402,6 +500,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output-dir", default="BFCL-TTRL")
     args = parser.parse_args()
+    if args.bfcl_eval_splits and not args.bfcl_summarize_multi_turn:
+        parser.error("--bfcl-eval-splits requires --bfcl-summarize-multi-turn")
     if args.bfcl_split == "seal" and (not args.bfcl_categories or args.bfcl_val_json):
         parser.error("--bfcl-split seal requires --bfcl-categories and cannot use --bfcl-val-json")
     if args.bfcl_eval_split == "heldout" and args.bfcl_split != "seal":
@@ -416,7 +516,9 @@ if __name__ == "__main__":
         print(f"BFCL result IDs match: {sum(map(len, case_ids.values()))} cases")
         raise SystemExit(0)
     if args.bfcl_summarize_multi_turn:
-        summarize_bfcl_multi_turn(args.bfcl_summarize_multi_turn, args.bfcl_model, args.bfcl_run_label)
+        summarize_bfcl_multi_turn(
+            args.bfcl_summarize_multi_turn, args.bfcl_model, args.bfcl_run_label, args.bfcl_eval_splits
+        )
         raise SystemExit(0)
     if args.bfcl_train_json or args.bfcl_categories:
         from bfcl_eval.utils import load_file

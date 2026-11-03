@@ -467,5 +467,136 @@ class TestBFCLMultiTurnSummary(unittest.TestCase):
                 self.assert_no_summary(root)
 
 
+class TestBFCLFlatMultiTurnSummary(unittest.TestCase):
+    model = TestBFCLMultiTurnSummary.model
+    write_jsonl = staticmethod(TestBFCLMultiTurnSummary.write_jsonl)
+
+    def create_runs(self, root, sides=("train", "heldout")):
+        source_path = Path(__file__).resolve().parents[3] / "data" / "bfcl_400_split.json"
+        source = load_bfcl_seal_split()
+        training_counts = ((1, 3), (1, 2), (0, 1), (4, 5))
+        heldout_counts = ((0, 2), (2, 3), (1, 1), (1, 4))
+        runs = {}
+        for index, (category, _) in enumerate(MULTI_TURN_COLUMNS):
+            child = root / category
+            data = child / "data"
+            data.mkdir(parents=True)
+            maps = {}
+            for side, key, counts in (("train", "train", training_counts), ("heldout", "test", heldout_counts)):
+                ids = [case_id for case_id in source[key] if case_id.startswith(category + "_")][:counts[index][1]]
+                maps[side] = {category: ids}
+                (data / f"{side}_case_ids.json").write_text(json.dumps(maps[side]), encoding="utf-8")
+            metadata = {
+                "split": "seal", "eval_split": "train", "setting": "same_case_adaptation",
+                "source": {"name": "SEAL", "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest()},
+                "selection": {"categories": [category], "consensus": "observations",
+                              "fs_only": False, "max_samples": 0},
+                "train_case_ids": maps["train"], "heldout_case_ids": maps["heldout"],
+                "eval_case_ids": maps["train"],
+            }
+            (data / "split_manifest.json").write_text(json.dumps(metadata), encoding="utf-8")
+            (data / "case_ids.json").write_text(json.dumps(maps["train"]), encoding="utf-8")
+            for side in sides:
+                directory = child / f"eval_{side}"
+                directory.mkdir()
+                case_path = directory / "test_case_ids_to_generate.json"
+                case_path.write_text(json.dumps(maps[side]), encoding="utf-8")
+                correct, total = (training_counts if side == "train" else heldout_counts)[index]
+                result = directory / bfcl_utils.get_file_name_by_category(category, is_result_file=True)
+                score = directory / bfcl_utils.get_file_name_by_category(category, is_score_file=True)
+                self.write_jsonl(result, [{"id": case_id, "result": []} for case_id in maps[side][category]])
+                self.write_jsonl(score, [{"correct_count": correct, "total_count": total}])
+                completed = {
+                    "bfcl_model": self.model, "case_ids_sha256": hashlib.sha256(case_path.read_bytes()).hexdigest(),
+                    "categories": [{"category": category, "correct_count": correct, "total_count": total}],
+                }
+                (directory / "summary.json").write_text(json.dumps(completed), encoding="utf-8")
+                runs[(category, side)] = {"directory": directory, "case_path": case_path,
+                                          "result": result, "score": score}
+        return runs
+
+    def test_paired_flat_evaluations_publish_two_separate_rows_with_exact_macro_averages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.create_runs(root)
+            summary = summarize_bfcl_multi_turn(root, self.model, "Paired | run", "train,heldout")
+            self.assertEqual(list(summary["evaluations"]), ["train", "heldout"])
+            self.assertAlmostEqual(summary["evaluations"]["train"]["average_accuracy"], (1 / 3 + 1 / 2 + 0 + 4 / 5) / 4)
+            self.assertAlmostEqual(summary["evaluations"]["heldout"]["average_accuracy"], (0 + 2 / 3 + 1 + 1 / 4) / 4)
+            for side in ("train", "heldout"):
+                self.assertEqual(summary["evaluations"][side]["data_protocol"]["eval_split"], side)
+            with (root / "multi_turn_summary.csv").open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.reader(handle))
+            self.assertEqual(rows[0][:3], ["Model", "Evaluation", "Average (%)"])
+            self.assertEqual(rows[1][1:], ["train", "40.83", "33.33", "50.00", "0.00", "80.00"])
+            self.assertEqual(rows[2][1:], ["heldout", "47.92", "0.00", "66.67", "100.00", "25.00"])
+            markdown = (root / "multi_turn_summary.md").read_text(encoding="utf-8")
+            self.assertIn("Paired \\| run | train", markdown)
+            self.assertIn("两次评测之间不更新参数", markdown)
+
+    def test_flat_single_side_and_auto_detection_keep_the_evaluation_label(self):
+        for sides in (("train",), ("heldout",), ("train", "heldout")):
+            with self.subTest(sides=sides), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.create_runs(root, sides)
+                summary = summarize_bfcl_multi_turn(root, self.model, "Auto")
+                if len(sides) == 1:
+                    self.assertEqual(summary["evaluation"], sides[0])
+                    self.assertIn("average_accuracy", summary)
+                else:
+                    self.assertEqual(set(summary["evaluations"]), set(sides))
+
+    def test_missing_side_or_incomplete_second_evaluation_never_publishes_a_combined_summary(self):
+        for fault in ("side", "result", "score", "summary", "wrong_model", "counts", "case_hash"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runs = self.create_runs(root, ("train",) if fault == "side" else ("train", "heldout"))
+                if fault != "side":
+                    run = runs[("multi_turn_long_context", "heldout")]
+                    if fault in ("result", "score", "summary"):
+                        (run["directory"] / "summary.json" if fault == "summary" else run[fault]).unlink()
+                    else:
+                        path = run["directory"] / "summary.json"
+                        completed = json.loads(path.read_text(encoding="utf-8"))
+                        if fault == "wrong_model":
+                            completed["bfcl_model"] = "Other/Model-FC"
+                        elif fault == "counts":
+                            completed["categories"][0]["total_count"] = 999
+                        else:
+                            completed["case_ids_sha256"] = "stale-case-list"
+                        path.write_text(json.dumps(completed), encoding="utf-8")
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    summarize_bfcl_multi_turn(root, self.model, "Broken", ["train", "heldout"])
+                self.assertEqual(list(root.glob("multi_turn_summary.*")), [])
+
+    def test_mixed_case_lists_source_or_overlapping_scenarios_are_rejected(self):
+        for fault in ("case_ids", "source", "overlap", "training_manifest", "selection"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runs = self.create_runs(root)
+                category = "multi_turn_long_context"
+                metadata_path = root / category / "data" / "split_manifest.json"
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if fault == "case_ids":
+                    runs[(category, "heldout")]["case_path"].write_text(
+                        json.dumps(metadata["train_case_ids"]), encoding="utf-8"
+                    )
+                elif fault == "source":
+                    metadata["source"]["sha256"] = "other-source"
+                elif fault == "overlap":
+                    metadata["heldout_case_ids"] = metadata["train_case_ids"]
+                    (root / category / "data" / "heldout_case_ids.json").write_text(
+                        json.dumps(metadata["train_case_ids"]), encoding="utf-8"
+                    )
+                elif fault == "training_manifest":
+                    metadata["train_case_ids"][category].pop()
+                else:
+                    metadata["selection"]["consensus"] = "calls"
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    summarize_bfcl_multi_turn(root, self.model, "Mixed", ["train", "heldout"])
+                self.assertEqual(list(root.glob("multi_turn_summary.*")), [])
+
+
 if __name__ == "__main__":
     unittest.main()
