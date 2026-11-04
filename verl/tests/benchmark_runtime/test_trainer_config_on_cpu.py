@@ -658,7 +658,7 @@ class TestBFCLTailBatches(unittest.TestCase):
         self.assertEqual(metrics["failure_epoch_rollouts"], 3200)
         self.assertEqual(metrics["failure_epoch_format_failure_count"], 128)
         self.assertAlmostEqual(metrics["failure_epoch_format_failure_rate"], 0.04)
-        self.assertAlmostEqual(metrics["failure_epoch_format_failure_next_weight"], 1.04)
+        self.assertAlmostEqual(metrics["failure_epoch_format_failure_next_weight"], 2.16)
 
 
 class TestEpochFailureLifecycle(unittest.TestCase):
@@ -728,7 +728,8 @@ class TestEpochFailureLifecycle(unittest.TestCase):
                 for epoch in range(self.trainer._training_epoch_count()):
                     iterator = iter(self.trainer.train_dataloader)
                     for cases in iterator:
-                        controller.observe(Rollouts(len(cases) * 8, updates >= completed_steps))
+                        failed = updates >= completed_steps or len(cases) < 32
+                        controller.observe(Rollouts(len(cases) * 8, failed))
                         self.trainer._finish_failure_epoch(iterator)
                         updates += 1
                         case_visits += len(cases)
@@ -741,9 +742,10 @@ class TestEpochFailureLifecycle(unittest.TestCase):
                 self.assertEqual(self.trainer._failure_epoch_batches, budget % 7)
                 self.assertEqual(controller.total_rollouts, budget % 7 * 32 * 8)
                 self.assertEqual(controller.counts["format_failure"], controller.total_rollouts)
-                # Only complete epochs (all failure-free here) may change weights.
-                expected_weight = 1.0 if budget >= 7 else controller.initial_weights["format_failure"]
-                self.assertEqual(controller.current_weights["format_failure"], expected_weight)
+                # Complete epochs have failures only in the tail batch (8 out of 200 cases).
+                # The incomplete epoch's failures must not affect the active weights.
+                expected_weight = 2.16 if budget >= 7 else controller.initial_weights["format_failure"]
+                self.assertAlmostEqual(controller.current_weights["format_failure"], expected_weight)
                 restored = weight_module.EpochFailureWeights({"enabled": True, "epoch_frequency": {"enabled": True}})
                 restored.load_state_dict(controller.state_dict())
                 self.assertEqual(restored.state_dict(), controller.state_dict())

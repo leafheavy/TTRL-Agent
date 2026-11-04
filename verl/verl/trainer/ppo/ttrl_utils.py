@@ -204,6 +204,8 @@ class EpochFailureWeights:
     rollouts. A failure type contributes at most one occurrence per rollout,
     regardless of event count or recovery. Types can co-occur, so their rates
     need not sum to one. The first epoch uses the configured static utilities.
+    Later epochs adjust each initial utility by its occurrence rate times
+    its relative share's deviation from a uniform distribution.
     """
 
     def __init__(self, config):
@@ -243,10 +245,12 @@ class EpochFailureWeights:
             "failure_epoch_completed": self.completed_epochs,
             "failure_epoch_rollouts": self.total_rollouts,
         }
-        maximum = self._config.get("max_weight", 2.0)
+        total_occurrences = sum(self.counts.values())
+        num_types = len(self.counts)
         for kind, count in self.counts.items():
             rate = count / self.total_rollouts
-            next_weight = 1.0 + (maximum - 1.0) * rate
+            share = count / total_occurrences if total_occurrences else 0.0
+            next_weight = self.initial_weights[kind] * (1.0 + rate * (num_types * share - 1.0))
             metrics.update({
                 f"failure_epoch_{kind}_count": count,
                 f"failure_epoch_{kind}_rate": rate,

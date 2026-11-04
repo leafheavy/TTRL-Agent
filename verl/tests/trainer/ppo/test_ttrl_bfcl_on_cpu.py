@@ -1177,7 +1177,7 @@ class TestTTRLFailureWeights(unittest.TestCase):
         self.assertEqual(controller.total_rollouts, 0)
         self.assertEqual(controller.completed_epochs, 0)
 
-    def test_epoch_weights_are_fixed_until_boundary_then_follow_rollout_rates(self):
+    def test_epoch_weights_are_fixed_until_boundary_then_follow_rollout_rates_and_shares(self):
         controller = self.dynamic()
         original = controller.effective_config()
         batch = self.make_batch([
@@ -1190,16 +1190,44 @@ class TestTTRLFailureWeights(unittest.TestCase):
         self.assertEqual(controller.effective_config(), original)
         metrics = controller.finish_epoch()
         self.assertEqual(controller.current_weights, {
-            "format_failure": 1.5, "schema_failure": 1.25, "precondition_violation": 1.25,
+            "format_failure": 2.5, "schema_failure": 1.875, "precondition_violation": 1.40625,
         })
         self.assertEqual(metrics["failure_epoch_completed"], 1)
         self.assertEqual(metrics["failure_epoch_rollouts"], 4)
         self.assertEqual(metrics["failure_epoch_format_failure_count"], 2)
         self.assertEqual(metrics["failure_epoch_format_failure_rate"], 0.5)
         self.assertEqual(metrics["failure_epoch_format_failure_weight"], 2.0)
-        self.assertEqual(metrics["failure_epoch_format_failure_next_weight"], 1.5)
+        self.assertEqual(metrics["failure_epoch_format_failure_next_weight"], 2.5)
         self.assertEqual(controller.total_rollouts, 0)
         self.assertEqual(sum(controller.counts.values()), 0)
+
+        controller.observe(batch)
+        metrics = controller.finish_epoch()
+        self.assertEqual(metrics["failure_epoch_format_failure_weight"], 2.5)
+        self.assertEqual(metrics["failure_epoch_format_failure_next_weight"], 2.5)
+
+    def test_epoch_equal_positive_rates_preserve_initial_weights(self):
+        controller = self.dynamic()
+        initial_weights = controller.effective_config()["type_weights"]
+        controller.observe(self.make_batch([
+            [self.event()], [self.event("schema_failure")], [self.event("precondition_violation")], [],
+        ]))
+        controller.finish_epoch()
+        self.assertEqual(controller.current_weights, initial_weights)
+
+    def test_epoch_weight_bounds_apply_to_the_rollout_average(self):
+        controller = self.dynamic(type_weights={"schema_failure": 0.5})
+        controller.observe(self.make_batch([
+            [self.event(), self.event("schema_failure")], [self.event()], [self.event()], [self.event()],
+        ]))
+        controller.finish_epoch()
+        self.assertAlmostEqual(controller.current_weights["format_failure"], 4.8)
+        self.assertAlmostEqual(controller.current_weights["schema_failure"], 0.45)
+        self.assertEqual(controller.current_weights["precondition_violation"], 1.5)
+
+        batch = self.make_batch([[self.event()], [self.event("schema_failure")], [self.event()], []], [1, 1, 4, 1])
+        apply_ttrl_failure_weights(batch, controller.effective_config())
+        torch.testing.assert_close(batch.batch["ttrl_failure_weight"], torch.tensor([2., 0.5, 1.95, 1.]))
 
     def test_epoch_counts_include_invalid_and_lower_priority_types_without_mutation(self):
         controller = self.dynamic()
@@ -1223,13 +1251,15 @@ class TestTTRLFailureWeights(unittest.TestCase):
 
     def test_epoch_counts_new_rollouts_once_and_do_not_accumulate_across_epochs(self):
         controller = self.dynamic()
+        initial_weights = controller.effective_config()["type_weights"]
         controller.observe(self.make_batch([[self.event()]] * 4))
         controller.finish_epoch()
+        self.assertEqual(controller.current_weights["format_failure"], 6.0)
         controller.observe(self.make_batch([[], [], [], []]))
         metrics = controller.finish_epoch()
         self.assertEqual(metrics["failure_epoch_completed"], 2)
         self.assertEqual(metrics["failure_epoch_rollouts"], 4)
-        self.assertEqual(controller.current_weights, dict.fromkeys(controller.current_weights, 1.0))
+        self.assertEqual(controller.current_weights, initial_weights)
 
     def test_epoch_recovery_status_and_turn_count_do_not_change_occurrence_unit(self):
         controller = self.dynamic()
@@ -1269,8 +1299,9 @@ class TestTTRLFailureWeights(unittest.TestCase):
         batch = self.make_batch([[self.event()], [], [], []], [2, 2, 2, 2])
         original = {key: tensor.clone() for key, tensor in batch.batch.items()}
         apply_ttrl_failure_weights(batch, controller.effective_config())
-        torch.testing.assert_close(batch.batch["ttrl_failure_weight"], torch.tensor([1.125, 1., 1., 1.]))
-        torch.testing.assert_close(batch.batch["advantages"], original["advantages"] * torch.tensor([1.125, 1., 1., 1.])[:, None])
+        expected_weights = torch.tensor([2., 1., 1., 1.])
+        torch.testing.assert_close(batch.batch["ttrl_failure_weight"], expected_weights)
+        torch.testing.assert_close(batch.batch["advantages"], original["advantages"] * expected_weights[:, None])
         for key in ("diagnostic_supervised_advantages", "returns", "token_level_scores", "response_mask"):
             torch.testing.assert_close(batch.batch[key], original[key], rtol=0, atol=0)
 
@@ -1311,9 +1342,6 @@ class TestTTRLFailureWeights(unittest.TestCase):
         for invalid in invalids:
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 validate_failure_weight_config(self.config(**invalid))
-        controller = self.dynamic(max_weight=3.0)
-        controller.observe(self.make_batch([[self.event()], [], [], []]))
-        self.assertEqual(controller.finish_epoch()["failure_epoch_format_failure_next_weight"], 1.5)
 
     def test_epoch_checkpoint_rejects_corrupt_state_before_mutating_controller(self):
         controller = self.dynamic()
