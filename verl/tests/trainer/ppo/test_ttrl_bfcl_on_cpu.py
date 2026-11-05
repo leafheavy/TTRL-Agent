@@ -1204,16 +1204,22 @@ class TestTTRLFailureWeights(unittest.TestCase):
         controller.observe(batch)
         metrics = controller.finish_epoch()
         self.assertEqual(metrics["failure_epoch_format_failure_weight"], 2.5)
-        self.assertEqual(metrics["failure_epoch_format_failure_next_weight"], 2.5)
+        self.assertEqual(metrics["failure_epoch_format_failure_next_weight"], 3.125)
+        self.assertEqual(controller.current_weights, {
+            "format_failure": 3.125, "schema_failure": 1.7578125, "precondition_violation": 1.318359375,
+        })
 
-    def test_epoch_equal_positive_rates_preserve_initial_weights(self):
+    def test_epoch_equal_positive_rates_preserve_current_weights(self):
         controller = self.dynamic()
-        initial_weights = controller.effective_config()["type_weights"]
+        controller.observe(self.make_batch([[self.event()], [], [], []]))
+        controller.finish_epoch()
+        current_weights = dict(controller.current_weights)
+        self.assertEqual(current_weights["format_failure"], 3.0)
         controller.observe(self.make_batch([
             [self.event()], [self.event("schema_failure")], [self.event("precondition_violation")], [],
         ]))
         controller.finish_epoch()
-        self.assertEqual(controller.current_weights, initial_weights)
+        self.assertEqual(controller.current_weights, current_weights)
 
     def test_epoch_weight_bounds_apply_to_the_rollout_average(self):
         controller = self.dynamic(type_weights={"schema_failure": 0.5})
@@ -1251,15 +1257,16 @@ class TestTTRLFailureWeights(unittest.TestCase):
 
     def test_epoch_counts_new_rollouts_once_and_do_not_accumulate_across_epochs(self):
         controller = self.dynamic()
-        initial_weights = controller.effective_config()["type_weights"]
         controller.observe(self.make_batch([[self.event()]] * 4))
         controller.finish_epoch()
+        current_weights = dict(controller.current_weights)
         self.assertEqual(controller.current_weights["format_failure"], 6.0)
         controller.observe(self.make_batch([[], [], [], []]))
         metrics = controller.finish_epoch()
         self.assertEqual(metrics["failure_epoch_completed"], 2)
         self.assertEqual(metrics["failure_epoch_rollouts"], 4)
-        self.assertEqual(controller.current_weights, initial_weights)
+        self.assertEqual(controller.current_weights, current_weights)
+        self.assertEqual(sum(controller.counts.values()), 0)
 
     def test_epoch_recovery_status_and_turn_count_do_not_change_occurrence_unit(self):
         controller = self.dynamic()
@@ -1311,6 +1318,7 @@ class TestTTRLFailureWeights(unittest.TestCase):
         second = self.make_batch([[self.event("schema_failure")], [], [], []])
         original.observe(first)
         original.finish_epoch()
+        self.assertEqual(original.current_weights["format_failure"], 3.0)
         original.observe(first)
         saved = json.loads(json.dumps(original.state_dict()))
         restored = self.dynamic()
@@ -1321,6 +1329,9 @@ class TestTTRLFailureWeights(unittest.TestCase):
             controller.observe(second)
         self.assertEqual(original.finish_epoch(), restored.finish_epoch())
         self.assertEqual(original.state_dict(), restored.state_dict())
+        self.assertEqual(restored.current_weights, {
+            "format_failure": 3.1875, "schema_failure": 2.125, "precondition_violation": 1.5,
+        })
 
     def test_epoch_malformed_batch_cannot_partially_change_counts(self):
         controller = self.dynamic()
@@ -1328,6 +1339,20 @@ class TestTTRLFailureWeights(unittest.TestCase):
         before = controller.state_dict()
         with self.assertRaisesRegex(ValueError, "processed user turn"):
             controller.observe(batch)
+        self.assertEqual(controller.state_dict(), before)
+
+    def test_epoch_overflow_cannot_partially_change_weights_or_epoch_state(self):
+        controller = self.dynamic()
+        controller.current_weights.update({"format_failure": 1.0, "schema_failure": 1e308})
+        controller.observe(self.make_batch([
+            [self.event(), self.event("schema_failure")],
+            [self.event("schema_failure")],
+            [self.event("schema_failure")],
+            [self.event("schema_failure")],
+        ]))
+        before = controller.state_dict()
+        with self.assertRaisesRegex(ValueError, "finite|positive|overflow"):
+            controller.finish_epoch()
         self.assertEqual(controller.state_dict(), before)
 
     def test_epoch_configuration_validates_dynamic_flag_even_when_disabled(self):

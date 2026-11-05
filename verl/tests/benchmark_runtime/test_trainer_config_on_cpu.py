@@ -744,7 +744,7 @@ class TestEpochFailureLifecycle(unittest.TestCase):
                 self.assertEqual(controller.counts["format_failure"], controller.total_rollouts)
                 # Complete epochs have failures only in the tail batch (8 out of 200 cases).
                 # The incomplete epoch's failures must not affect the active weights.
-                expected_weight = 2.16 if budget >= 7 else controller.initial_weights["format_failure"]
+                expected_weight = controller.initial_weights["format_failure"] * 1.08 ** (budget // 7)
                 self.assertAlmostEqual(controller.current_weights["format_failure"], expected_weight)
                 restored = weight_module.EpochFailureWeights({"enabled": True, "epoch_frequency": {"enabled": True}})
                 restored.load_state_dict(controller.state_dict())

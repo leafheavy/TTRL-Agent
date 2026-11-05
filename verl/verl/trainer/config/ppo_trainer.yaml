@@ -23,7 +23,7 @@ failure_mode_detection:
     max_weight: 2.0
 
     # Optional epoch-level updates using per-type rollout occurrence rates and relative shares.
-    # The first epoch uses type_weights; later epochs scale them by 1 + rate * (num_types * share - 1).
+    # The first epoch uses type_weights; each boundary scales current weights by 1 + rate * (num_types * share - 1).
     epoch_frequency:
 
       # Requires diagnostics, advantage weighting, and complete training epochs.

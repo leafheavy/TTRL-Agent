@@ -204,7 +204,7 @@ class EpochFailureWeights:
     rollouts. A failure type contributes at most one occurrence per rollout,
     regardless of event count or recovery. Types can co-occur, so their rates
     need not sum to one. The first epoch uses the configured static utilities.
-    Later epochs adjust each initial utility by its occurrence rate times
+    Later epochs adjust each current utility by its occurrence rate times
     its relative share's deviation from a uniform distribution.
     """
 
@@ -240,24 +240,28 @@ class EpochFailureWeights:
     def finish_epoch(self):
         if not self.enabled or not self.total_rollouts:
             return {}
-        self.completed_epochs += 1
         metrics = {
-            "failure_epoch_completed": self.completed_epochs,
+            "failure_epoch_completed": self.completed_epochs + 1,
             "failure_epoch_rollouts": self.total_rollouts,
         }
         total_occurrences = sum(self.counts.values())
         num_types = len(self.counts)
+        next_weights = {}
         for kind, count in self.counts.items():
             rate = count / self.total_rollouts
             share = count / total_occurrences if total_occurrences else 0.0
-            next_weight = self.initial_weights[kind] * (1.0 + rate * (num_types * share - 1.0))
+            next_weight = self.current_weights[kind] * (1.0 + rate * (num_types * share - 1.0))
+            if not np.isfinite(next_weight) or next_weight <= 0:
+                raise ValueError("Epoch failure weights must remain finite and positive")
+            next_weights[kind] = next_weight
             metrics.update({
                 f"failure_epoch_{kind}_count": count,
                 f"failure_epoch_{kind}_rate": rate,
                 f"failure_epoch_{kind}_weight": self.current_weights[kind],
                 f"failure_epoch_{kind}_next_weight": next_weight,
             })
-            self.current_weights[kind] = next_weight
+        self.current_weights = next_weights
+        self.completed_epochs += 1
         self.counts = {kind: 0 for kind in _FAILURE_TYPE_WEIGHTS}
         self.total_rollouts = 0
         return metrics
